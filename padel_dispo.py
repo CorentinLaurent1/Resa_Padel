@@ -1668,13 +1668,19 @@ async function afterLogin(){
   load(); refreshAccounts();
 }
 async function follow(){
-  for(;;){
+  const deadline=Date.now()+360000;   // au-delà de 6 min, on cesse d'attendre
+  let fails=0;
+  function stop(){ $("gBtn").disabled=false; $("winBtn").disabled=false; }
+  while(Date.now()<deadline){
     await new Promise(r=>setTimeout(r,1000));
-    const st=await (await fetch("/api/login/status")).json();
+    let st;
+    try{ st=await (await fetch("/api/login/status")).json(); fails=0; }
+    catch(e){ if(++fails>=8){ setG("Connexion perdue avec le serveur. Réessaie.","bad"); stop(); return; } continue; }
     if(st.state==="done"){ setG(st.message,"ok"); setTimeout(afterLogin,900); return; }
-    if(st.state==="error"){ setG(st.message,"bad"); $("gBtn").disabled=false; $("winBtn").disabled=false; return; }
-    setG(st.message);
+    if(st.state==="error"){ setG(st.message,"bad"); stop(); return; }
+    setG(st.message||"Connexion en cours…");
   }
+  setG("La connexion prend trop de temps. Réessaie.","bad"); stop();
 }
 $("sheetClose").onclick=()=>$("sheet").close();
 $("credForm").onsubmit=async e=>{
