@@ -1,0 +1,17 @@
+# Sessions et identifiants des utilisateurs — ne JAMAIS publier
+donnees/
+identifiants.dat
+.4padel_token
+.letpadel_token
+.smash_session
+
+# Profil et navigateur
+.chrome-padel/
+.chrome-4padel/
+ms-playwright/
+
+# Divers
+__pycache__/
+*.pyc
+.env
+*.har

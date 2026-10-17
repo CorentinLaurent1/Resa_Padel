@@ -1277,6 +1277,14 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .check{width:26px;height:26px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;background:var(--fill);color:transparent}
 .check.on{background:var(--green);color:#fff}
 .btn-wide.dim{background:var(--fill);color:var(--muted)}
+.btn-wide:disabled,.btn-ghost:disabled{cursor:progress}
+.loading{color:transparent!important;position:relative;pointer-events:none}
+.loading::after{content:"";position:absolute;top:50%;left:50%;width:18px;height:18px;margin:-9px 0 0 -9px;
+  border:2.5px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
+.btn-ghost.loading::after{border-color:rgba(127,127,127,.35);border-top-color:var(--accent)}
+.status.wait::before{content:"";display:inline-block;width:13px;height:13px;margin-right:7px;vertical-align:-1px;
+  border:2px solid var(--hair);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .skel{height:64px;border-radius:14px;background:linear-gradient(90deg,var(--card) 0%,var(--fill) 50%,var(--card) 100%);background-size:200% 100%;animation:sk 1.2s linear infinite;margin-top:12px}
 @keyframes sk{to{background-position:-200% 0}}
 .refresh{border:0;background:none;color:var(--accent);font-size:.85rem;font-weight:600;cursor:pointer;padding:0;margin-left:6px}
@@ -1667,7 +1675,8 @@ const ACCOUNTS=[
   {id:"smash", name:"Smash Padel", note:"Saint-Denis-en-Val", required:true}];
 const ready = a => !!a && (a.connected || a.saved);   // identifiants enregistrés : reconnexion automatique
 let PROVIDER="4padel";
-function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:""); }
+function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:(msg?" wait":"")); }
+function busy(btn, on){ if(!btn) return; btn.disabled=on; btn.classList.toggle("loading", on); }
 async function openSheet(p){
   PROVIDER=SHEETS[p]?p:"4padel"; const c=SHEETS[PROVIDER];
   $("sheetTitle").textContent=c.title;
@@ -1693,13 +1702,13 @@ async function afterLogin(){
 async function follow(){
   const deadline=Date.now()+360000;   // au-delà de 6 min, on cesse d'attendre
   let fails=0;
-  function stop(){ $("gBtn").disabled=false; $("winBtn").disabled=false; }
+  function stop(){ busy($("gBtn"), false); busy($("winBtn"), false); }
   while(Date.now()<deadline){
     await new Promise(r=>setTimeout(r,1000));
     let st;
     try{ st=await (await fetch("/api/login/status")).json(); fails=0; }
     catch(e){ if(++fails>=8){ setG("Connexion perdue avec le serveur. Réessaie.","bad"); stop(); return; } continue; }
-    if(st.state==="done"){ setG(st.message,"ok"); setTimeout(afterLogin,900); return; }
+    if(st.state==="done"){ setG(st.message,"ok"); busy($("gBtn"), false); busy($("winBtn"), false); setTimeout(afterLogin,900); return; }
     if(st.state==="error"){ setG(st.message,"bad"); stop(); return; }
     setG(st.message||"Connexion en cours…");
   }
@@ -1707,19 +1716,19 @@ async function follow(){
 }
 $("sheetClose").onclick=()=>$("sheet").close();
 $("credForm").onsubmit=async e=>{
-  e.preventDefault(); $("gBtn").disabled=true; setG("Connexion en cours…");
+  e.preventDefault(); busy($("gBtn"), true); setG("Connexion en cours…");
   try{
     const r=await fetch("/api/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({provider:PROVIDER,email:$("cEmail").value,password:$("cPass").value,remember:$("cRemember").checked})});
     $("cPass").value="";
-    if(!r.ok){ const j=await r.json(); setG(j.error||"Échec.","bad"); $("gBtn").disabled=false; return; }
+    if(!r.ok){ const j=await r.json(); setG(j.error||"Échec.","bad"); busy($("gBtn"), false); return; }
     await follow();
-  }catch(err){ setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); $("gBtn").disabled=false; }
+  }catch(err){ setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); busy($("gBtn"), false); }
 };
 $("winBtn").onclick=async()=>{
-  $("winBtn").disabled=true; setG("Ouverture de Chrome…");
+  busy($("winBtn"), true); setG("Ouverture de Chrome…");
   try{ await fetch("/api/login/window",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:PROVIDER})}); await follow(); }
-  catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); $("winBtn").disabled=false; }
+  catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); busy($("winBtn"), false); }
 };
 /* Onglets et réglages */
 function showTab(name){
