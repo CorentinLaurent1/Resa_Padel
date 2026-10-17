@@ -331,6 +331,8 @@ CREDS_FILE = os.path.join(HERE, "identifiants.dat")
 
 
 def _dpapi(data, protect):
+    if os.name != "nt" or not hasattr(__import__("ctypes"), "windll"):
+        raise OSError("chiffrement Windows indisponible sur ce système")
     import ctypes
     from ctypes import wintypes
 
@@ -361,6 +363,10 @@ def load_creds():
         creds = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
         pass
+    except Exception:
+        # Fichier chiffré par Windows sur un autre ordinateur (ou un autre compte) :
+        # illisible ici, on l'ignore. Il sera remplacé à la prochaine connexion.
+        creds = {}
     for key, env in (("4padel", "4PADEL"), ("letpadel", "LETPADEL"), ("smash", "SMASH")):   # variables d'environnement prioritaires
         e, p = os.environ.get(f"PADEL_{env}_EMAIL"), os.environ.get(f"PADEL_{env}_PASSWORD")
         if e and p:
@@ -369,11 +375,14 @@ def load_creds():
 
 
 def save_creds(creds):
-    data = json.dumps(creds).encode("utf-8")
-    if os.name == "nt":
+    # Les identifiants venant des variables d'environnement ne sont jamais écrits sur disque.
+    env_only = {k for k in ("4padel", "letpadel", "smash")
+                if os.environ.get(f"PADEL_{k.upper()}_EMAIL") and os.environ.get(f"PADEL_{k.upper()}_PASSWORD")}
+    data = json.dumps({k: v for k, v in creds.items() if k not in env_only}).encode("utf-8")
+    try:
         blob = b"DPAPI1\n" + base64.b64encode(_dpapi(data, True))
-    else:
-        blob = b"PLAIN1\n" + base64.b64encode(data)
+    except OSError:
+        blob = b"PLAIN1\n" + base64.b64encode(data)   # hors Windows : lisible par ton seul utilisateur
     tmp = CREDS_FILE + ".tmp"
     with open(tmp, "wb") as f:
         f.write(blob)
@@ -1626,4 +1635,3 @@ if(LIVE) gate(); else load();
 
 if __name__ == "__main__":
     main()
-
