@@ -274,7 +274,7 @@ def find_chrome():
             p = shutil.which(n)
             if p:
                 cands.append(p)
-    return next((c for c in cands if c and os.path.exists(c)), None)
+    return next((c for c in cands if c and os.path.exists(c)), None)   # None => Playwright utilise son Chromium
 
 
 def _attach_capture(ctx, provider, found):
@@ -636,20 +636,42 @@ def _done_message(provider, value):
     return f"Connecté à {name}" + (f" jusqu’au {exp:%d/%m}." if exp else ".")
 
 
+def launch_browser(pw, chrome):
+    """Lance un navigateur headless : d'abord le Chrome du système, sinon le Chromium de Playwright."""
+    last = None
+    for kwargs in ([{"executable_path": chrome}] if chrome else []) + [{}]:
+        try:
+            return pw.chromium.launch(headless=True, **kwargs)
+        except Exception as e:
+            last = e
+    hint = chromium_hint()
+    raise RuntimeError("Le navigateur n’a pas pu démarrer. " + hint + (f" Détail : {last}" if last else ""))
+
+
+def chromium_hint():
+    """Message adapté : où Playwright cherche Chromium et pourquoi il ne le trouve pas."""
+    path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    import importlib.util
+    installed = importlib.util.find_spec("playwright") is not None
+    if not installed:
+        return "Le module playwright n’est pas installé : « pip install playwright »."
+    if CLOUD and not path:
+        return ("Sur un serveur, définis la variable PLAYWRIGHT_BROWSERS_PATH (par ex. "
+                "/opt/render/project/src/ms-playwright) au build ET à l’exécution, puis "
+                "« playwright install --with-deps chromium » avec la même variable.")
+    return "Installe le navigateur : « playwright install --with-deps chromium »."
+
+
 def auto_login(provider, email, password, report=lambda m: None):
     """Connexion invisible avec e-mail et mot de passe. Renvoie la session du club."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise RuntimeError("Le module playwright n’est pas installé sur ce serveur.")
-    chrome = find_chrome()
+    chrome = find_chrome()                      # un vrai Chrome du système, s'il y en a un
     report("En attente d’un navigateur libre…")
     with BROWSERS, sync_playwright() as pw:
-        try:
-            browser = (pw.chromium.launch(executable_path=chrome, headless=True) if chrome
-                       else pw.chromium.launch(headless=True))
-        except Exception:
-            raise RuntimeError("Aucun navigateur disponible : installe Chrome, ou lance « playwright install chromium ».")
+        browser = launch_browser(pw, chrome)
         try:
             ctx = browser.new_context(locale="fr-FR", user_agent=UA, viewport={"width": 1280, "height": 900})
             found = {}
@@ -1283,10 +1305,10 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   <div class="onb">
     <p class="kicker">Padel à Orléans</p>
     <h1>Connecte tes clubs</h1>
-    <p class="lead">Connecte ton compte 4PADEL et ton compte Let Padel pour voir leurs créneaux libres. Pas encore de compte ? Crée-le sur le site du club, c’est gratuit.</p>
+    <p class="lead">Connecte tes comptes 4PADEL, Let Padel et Smash Padel pour voir leurs créneaux libres. Pas encore de compte dans un club ? Crée-le sur son site, c’est gratuit.</p>
     <section class="group" id="onbList"></section>
     <button class="btn-wide dim" id="onbGo" type="button" disabled>Voir les créneaux</button>
-    <p class="foot" id="onbFoot">Encore 2 comptes à connecter.</p>
+    <p class="foot" id="onbFoot">Encore 3 comptes à connecter.</p>
     <p class="foot">Tes connexions sont chiffrées avec une clé gardée dans ton navigateur. Tu peux tout supprimer depuis l’onglet Comptes.</p>
   </div>
 </main>
@@ -1588,8 +1610,8 @@ async function checkGate(){
   $("onbList").innerHTML=ACCOUNTS.map(x=>acctRow(x, a[x.id]||{}, true)).join("");
   $("onbGo").disabled=!!missing.length; $("onbGo").classList.toggle("dim", !!missing.length);
   $("onbFoot").textContent = missing.length
-    ? (missing.length===2 ? "Encore 2 comptes à connecter." : `Plus que ${missing[0].name} à connecter.`)
-    : "Tout est prêt. Smash Padel peut se connecter plus tard depuis l’onglet Comptes.";
+    ? (missing.length===1 ? `Plus que ${missing[0].name} à connecter.` : `Encore ${missing.length} comptes à connecter.`)
+    : "Tout est prêt. Tu peux voir les créneaux.";
   wire();
   return !missing.length;
 }
@@ -1619,7 +1641,7 @@ const SHEETS={
 const ACCOUNTS=[
   {id:"4padel", name:"4PADEL Orléans", note:"Fleury-les-Aubrais", required:true},
   {id:"letpadel", name:"Let Padel", note:"Un seul compte pour Saint-Pryvé et Fleury", required:true},
-  {id:"smash", name:"Smash Padel", note:"Saint-Denis-en-Val", required:false}];
+  {id:"smash", name:"Smash Padel", note:"Saint-Denis-en-Val", required:true}];
 const ready = a => !!a && (a.connected || a.saved);   // identifiants enregistrés : reconnexion automatique
 let PROVIDER="4padel";
 function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:""); }
