@@ -1160,17 +1160,17 @@ PAGE = r'''<!DOCTYPE html>
 <meta name="application-name" content="Padel Orléans">
 <style>
 :root{
-  --bg:#F2F2F7; --card:#FFFFFF; --ink:#000000; --muted:#6C6C70; --hair:#E5E5EA; --fill:#E9E9EE; --seg:#FFFFFF;
+  --bg:#F2F2F7; --card:#FFFFFF; --ink:#000000; --muted:#5B5B60; --hair:#E5E5EA; --fill:#E9E9EE; --seg:#FFFFFF;
   --blue:#007AFF; --green:#34C759; --orange:#FF9500; --red:#FF3B30;
   --accent:var(--blue); --on-accent:#FFFFFF; --tabbar:rgba(249,249,251,.86);
   color-scheme:light; box-sizing:border-box;
   padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
 }
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
-  --bg:#000000; --card:#1C1C1E; --ink:#FFFFFF; --muted:#98989F; --hair:#38383A; --fill:#2C2C2E; --seg:#636366;
+  --bg:#000000; --card:#1C1C1E; --ink:#FFFFFF; --muted:#A6A6AE; --hair:#38383A; --fill:#2C2C2E; --seg:#636366;
   --blue:#0A84FF; --green:#30D158; --orange:#FF9F0A; --red:#FF453A; --tabbar:rgba(22,22,24,.86); color-scheme:dark;}}
 :root[data-theme="dark"]{
-  --bg:#000000; --card:#1C1C1E; --ink:#FFFFFF; --muted:#98989F; --hair:#38383A; --fill:#2C2C2E; --seg:#636366;
+  --bg:#000000; --card:#1C1C1E; --ink:#FFFFFF; --muted:#A6A6AE; --hair:#38383A; --fill:#2C2C2E; --seg:#636366;
   --blue:#0A84FF; --green:#30D158; --orange:#FF9F0A; --red:#FF453A; --tabbar:rgba(22,22,24,.86); color-scheme:dark;}
 :root[data-accent="green"]{--accent:var(--green)}
 :root[data-accent="orange"]{--accent:var(--orange)}
@@ -1503,6 +1503,9 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 
 <script>
 const LIVE = window.PADEL_LIVE === true;
+// Démarre la requête des comptes immédiatement, sans attendre la fin du script,
+// pour qu'elle voyage en parallèle (chaîne critique plus courte, cf. Lighthouse).
+const ACCOUNTS_READY = LIVE ? fetch("/api/accounts").then(r=>r.json()).catch(()=>({})) : Promise.resolve({});
 const H = (wk, we) => ({wk, we});
 const CLUBS = [
   {id:"4padel", name:"4PADEL Orléans", city:"Fleury-les-Aubrais", courts:"6 pistes indoor", account:true,
@@ -1723,7 +1726,7 @@ function acctRow(x, st, onboarding){
 
 /* Accueil : 4PADEL et Let Padel obligatoires */
 async function checkGate(){
-  try{ S.accounts=await (await fetch("/api/accounts")).json(); }catch(e){ S.accounts=S.accounts||{}; }
+  try{ S.accounts=await ACCOUNTS_READY; }catch(e){ S.accounts=S.accounts||{}; }
   const a=S.accounts||{};
   const missing=ACCOUNTS.filter(x=>x.required && !ready(a[x.id]));
   $("onbList").innerHTML=ACCOUNTS.map(x=>acctRow(x, a[x.id]||{}, true)).join("");
