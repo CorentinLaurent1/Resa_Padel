@@ -14,7 +14,7 @@ import base64, datetime, json, os, re, shutil, subprocess, sys, threading, time,
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8765
+PORT = int(os.environ.get("PORT", 8765))
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.path.join(HERE, ".4padel_token")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -704,8 +704,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     url = f"http://127.0.0.1:{PORT}"
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Padel Orléans tourne sur {url}  (Ctrl+C pour arrêter)")
+    # Écouter sur 0.0.0.0 est obligatoire pour que Render détecte le port ouvert
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Padel Orléans tourne sur le port {PORT}  (Ctrl+C pour arrêter)")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
