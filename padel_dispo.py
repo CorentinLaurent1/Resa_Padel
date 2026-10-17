@@ -39,6 +39,8 @@ LETPADEL_CLUBS = {
 SMASH_BASE = "https://smashpadel.mymobileapp.fr"
 SMASH_SPORT_PADEL = "2"
 SMASH_FILE = os.path.join(HERE, ".smash_session")
+LETPADEL_TOKEN_FILE = os.path.join(HERE, ".letpadel_token")
+LETPADEL_HOME = "https://letpadel.doinsport.club/home"
 FOURPADEL_CENTER_ID = 9        # « LE FIVE Orléans Fleury »
 FOURPADEL_SPORT_PADEL = 3
 
@@ -152,6 +154,47 @@ def is_4padel_token(token):
         return "upn" in p and "roleId" in p
     except Exception:
         return False
+
+
+def is_doinsport_token(token):
+    """Jeton de compte Doinsport : JWT dont le contenu désigne un utilisateur."""
+    try:
+        p = jwt_payload(token)
+        return bool(p.get("username") or p.get("email") or p.get("roles") or p.get("user") or p.get("sub"))
+    except Exception:
+        return False
+
+
+def read_letpadel_token():
+    try:
+        with open(LETPADEL_TOKEN_FILE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def save_letpadel_token(token):
+    with open(LETPADEL_TOKEN_FILE, "w", encoding="utf-8") as f:
+        f.write(token)
+    try:
+        os.chmod(LETPADEL_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def session_state(provider):
+    """(connecté ?, date d'expiration ou None)"""
+    if provider == "4padel":
+        tok = read_token()
+    elif provider == "letpadel":
+        tok = read_letpadel_token()
+    else:
+        sm = read_smash()
+        return bool(sm and sm.get("token")), None
+    if not tok:
+        return False, None
+    exp = token_expiry(tok)
+    return (exp is None or exp > datetime.datetime.now()), exp
 
 
 def save_token(token):
@@ -318,7 +361,7 @@ def load_creds():
         creds = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
         pass
-    for key, env in (("4padel", "4PADEL"), ("smash", "SMASH")):   # variables d'environnement prioritaires
+    for key, env in (("4padel", "4PADEL"), ("letpadel", "LETPADEL"), ("smash", "SMASH")):   # variables d'environnement prioritaires
         e, p = os.environ.get(f"PADEL_{env}_EMAIL"), os.environ.get(f"PADEL_{env}_PASSWORD")
         if e and p:
             creds[key] = {"email": e, "password": p}
@@ -349,6 +392,8 @@ def save_creds(creds):
 SIGNIN_URL = "https://www.4padel.fr/signin?redirect=%2Freservations%2Fslots"
 API_HOST_MATCH = "lefive.fr"
 SMASH_HOST_MATCH = "smashpadel.mymobileapp.fr"
+DOIN_HOST_MATCH = "doinsport.club"            # API et site Let Padel
+LETPADEL_PAGE_MATCH = "letpadel.doinsport.club"
 PROFILE_DIR = os.path.join(HERE, ".chrome-4padel")
 CDP_PORT = 9223
 LOGIN = {"state": "idle", "message": ""}
@@ -360,6 +405,8 @@ LS_SCAN = "() => Object.keys(localStorage).map(k => localStorage.getItem(k) || '
 PROVIDERS = {
     "4padel": {"url": SIGNIN_URL, "name": "4PADEL",
                "hint": "Dans la fenêtre Chrome, connecte-toi à 4PADEL."},
+    "letpadel": {"url": LETPADEL_HOME, "name": "Let Padel",
+                 "hint": "Dans la fenêtre Chrome, connecte-toi à Let Padel."},
     "smash": {"url": SMASH_BASE + "/", "name": "Smash Padel",
               "hint": "Dans la fenêtre Chrome, connecte-toi à Smash Padel puis ouvre « Nouvelle réservation »."},
 }
@@ -381,7 +428,7 @@ FIND_FORM_JS = r"""() => {
   return true;
 }"""
 REVEAL_JS = r"""() => {
-  const re = /(e-?mail|adresse|mot de passe|identifi|se connecter|connexion|j'ai déjà un compte|déjà membre|log ?in|sign ?in)/i;
+  const re = /(e-?mail|adresse|mot de passe|identifi|se connecter|connexion|j'ai déjà un compte|déjà membre|log ?in|sign ?in|mon compte|mon profil)/i;
   const bad = /(google|apple|facebook|inscri|créer|newsletter|abonne)/i;
   const els = [...document.querySelectorAll('button, a, [role=button]')]
     .filter(el => el.offsetParent !== null && re.test(el.textContent || '') && !bad.test(el.textContent || ''));
@@ -421,8 +468,10 @@ def set_login(state, message):
 
 
 def _attach_capture(ctx, provider, found):
+    check = is_4padel_token if provider == "4padel" else is_doinsport_token
+
     def keep(value):
-        if value and "token" not in found and is_4padel_token(value):
+        if value and "token" not in found and check(value):
             found["token"] = value.strip()
     found["_keep"] = keep
 
@@ -434,6 +483,13 @@ def _attach_capture(ctx, provider, found):
                 except Exception:
                     auth = req.headers.get("authorization", "")
                 keep(auth)
+            elif provider == "letpadel" and DOIN_HOST_MATCH in req.url:
+                try:
+                    auth = req.all_headers().get("authorization", "")
+                except Exception:
+                    auth = req.headers.get("authorization", "")
+                if auth.lower().startswith("bearer "):
+                    keep(auth)
             elif provider == "smash" and SMASH_HOST_MATCH in req.url and "token" not in found:
                 m = TOKEN_RE.search(req.post_data or "")
                 if m:
@@ -442,6 +498,16 @@ def _attach_capture(ctx, provider, found):
             pass
 
     def on_response(resp):
+        if provider == "letpadel" and DOIN_HOST_MATCH in resp.url and re.search(r"login|token|auth", resp.url, re.I):
+            try:
+                if resp.ok:
+                    j = resp.json()
+                    keep(j.get("token") or j.get("access_token"))
+                elif resp.status in (400, 401, 403):
+                    found["refused"] = True
+            except Exception:
+                pass
+            return
         if provider == "4padel" and API_HOST_MATCH in resp.url and "/login" in resp.url:
             try:
                 if resp.ok:
@@ -461,6 +527,9 @@ def _scan(ctx, provider, found):
             if provider == "4padel" and pg.url.startswith("https://www.4padel.fr"):
                 for m in JWT_RE.findall(pg.evaluate(LS_SCAN) or ""):
                     found["_keep"](m)
+            elif provider == "letpadel" and LETPADEL_PAGE_MATCH in pg.url:
+                for m in JWT_RE.findall(pg.evaluate(LS_SCAN) or ""):
+                    found["_keep"](m)
             elif provider == "smash" and SMASH_HOST_MATCH in pg.url:
                 html = pg.content()
                 if "logout.asp" in html:
@@ -470,12 +539,16 @@ def _scan(ctx, provider, found):
                         found["token"] = m.group(1)
         except Exception:
             pass
-    if provider == "4padel":
+    if provider in ("4padel", "letpadel"):
         return "token" in found
     return "token" in found and found.get("logged")
 
 
 def _persist(ctx, provider, found):
+    if provider == "letpadel":
+        save_letpadel_token(found["token"])
+        exp = token_expiry(found["token"])
+        return "Connecté à Let Padel" + (f" jusqu’au {exp:%d/%m}." if exp else ".")
     if provider == "4padel":
         save_token(found["token"])
         exp = token_expiry(found["token"])
@@ -738,7 +811,22 @@ def run(fn, *args, provider=None):
         return {"status": "error", "message": f"Pas de réponse ({type(e).__name__})."}
 
 
+def keep_sessions_alive():
+    for provider in ("letpadel",):
+        ok, _ = session_state(provider)
+        if not ok and (load_creds_safe().get(provider)):
+            threading.Thread(target=relogin_if_possible, args=(provider,), daemon=True).start()
+
+
+def load_creds_safe():
+    try:
+        return load_creds()
+    except Exception:
+        return {}
+
+
 def all_slots(date, duration):
+    keep_sessions_alive()
     jobs = {"4padel": (fourpadel_slots, date, duration), "smash": (smash_slots, date, duration)}
     for key, cid in LETPADEL_CLUBS.items():
         if cid:
@@ -813,17 +901,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/login/status":
             return self.send(200, LOGIN)
         if u.path == "/api/accounts":
-            try:
-                c = load_creds()
-            except Exception:
-                c = {}
-            out = {k: {"email": v.get("email", "")} for k, v in c.items()}
-            tok = read_token()
-            exp = token_expiry(tok) if tok else None
-            ok4 = bool(tok) and (exp is None or exp > datetime.datetime.now())
-            out.setdefault("4padel", {}).update(connected=ok4, until=f"{exp:%d/%m}" if ok4 and exp else None)
-            sm = read_smash()
-            out.setdefault("smash", {}).update(connected=bool(sm and sm.get("token")), until=None)
+            creds = load_creds_safe()
+            out = {}
+            for p in ("4padel", "letpadel", "smash"):
+                ok, exp = session_state(p)
+                out[p] = {"email": (creds.get(p) or {}).get("email", ""), "connected": ok,
+                          "until": f"{exp:%d/%m}" if ok and exp else None, "saved": bool(creds.get(p))}
             return self.send(200, out)
         self.send(404, {"error": "Introuvable."})
 
@@ -926,6 +1009,7 @@ PAGE = r'''<!DOCTYPE html>
 :root[data-accent="green"]{--accent:var(--green)}
 :root[data-accent="orange"]{--accent:var(--orange)}
 *,*::before,*::after{box-sizing:inherit}
+[hidden]{display:none!important}
 html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
 body{margin:0;background:var(--bg);color:var(--ink);min-height:100%;
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","Segoe UI",Roboto,Arial,sans-serif;
@@ -1050,13 +1134,79 @@ dialog::backdrop{background:rgba(0,0,0,.35)}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.bad{background:var(--red);color:#fff}
 a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:2px;border-radius:8px}
-@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+/* Accueil obligatoire */
+.onb{max-width:560px;margin:0 auto;padding:28px 16px calc(40px + env(safe-area-inset-bottom,0px))}
+.onb h1{font-size:2rem;margin:4px 4px 8px}
+.onb .lead{color:var(--muted);margin:0 4px 22px;font-size:1rem;line-height:1.45}
+.req{font-size:.72rem;font-weight:600;color:var(--muted);background:var(--fill);border-radius:6px;padding:1px 6px;margin-left:6px;vertical-align:2px}
+.req.opt{background:none;border:1px solid var(--hair)}
+.check{width:26px;height:26px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;background:var(--fill);color:transparent}
+.check.on{background:var(--green);color:#fff}
+.btn-wide.dim{background:var(--fill);color:var(--muted)}
+.skel{height:64px;border-radius:14px;background:linear-gradient(90deg,var(--card) 0%,var(--fill) 50%,var(--card) 100%);background-size:200% 100%;animation:sk 1.2s linear infinite;margin-top:12px}
+@keyframes sk{to{background-position:-200% 0}}
+.refresh{border:0;background:none;color:var(--accent);font-size:.85rem;font-weight:600;cursor:pointer;padding:0;margin-left:6px}
+.brand{display:none}
+
+@media (min-width: 640px) and (max-width: 859px){
+  .screen{max-width:720px;padding-left:24px;padding-right:24px}
+  .days{margin:0 0 14px;padding:2px 0;display:grid;grid-template-columns:repeat(7,1fr)}
+  .day{width:auto}
+}
+/* ---------- Grand écran : filtres à gauche, résultats en grille ---------- */
+@media (min-width: 860px){
+  body{font-size:16px}
+  .tabbar{top:0;bottom:auto;justify-content:flex-start;align-items:center;gap:6px;padding:10px max(24px,calc((100vw - 1180px)/2 + 24px));
+    padding-top:calc(10px + env(safe-area-inset-top,0px));border-top:0;border-bottom:.5px solid var(--hair)}
+  .brand{display:block;font-weight:700;font-size:1.05rem;letter-spacing:-.02em;margin-right:auto}
+  .tab{flex:0 0 auto;flex-direction:row;gap:7px;font-size:.92rem;padding:7px 14px;border-radius:999px}
+  .tab svg{width:20px;height:20px}
+  .tab[aria-selected="true"]{background:var(--fill)}
+  .screen{max-width:1180px;padding:84px 24px 48px}
+  #scr-slots{display:grid;grid-template-columns:340px minmax(0,1fr);grid-template-areas:"filters hdr" "filters results";column-gap:32px;align-items:start}
+  .hdr{grid-area:hdr}
+  .filters{grid-area:filters;position:sticky;top:84px}
+  .results{grid-area:results;min-width:0}
+  .filters .kicker{display:none}
+  .days{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin:0 0 14px;padding:0;overflow:visible}
+  .day{width:auto;padding:8px 0 7px;border-radius:12px}
+  .day b{font-size:1.15rem}
+  .hdr .kicker{display:none}
+  .filters .grow{flex-direction:column;align-items:stretch;gap:8px;padding:12px 0}
+  .filters .glabel{flex:none;font-size:.85rem;color:var(--muted);font-weight:600}
+  .filters .seg{flex:none}
+  .hours{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;overflow:visible;flex:none}
+  .hours button{padding:7px 0}
+  #list.v-time{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:4px 20px}
+  #list.v-time .tgroup{margin-top:16px}
+  #list.v-club{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  #list.v-club .club{margin-top:0}
+  #scr-accounts{max-width:680px}
+  dialog{margin:auto;border-radius:18px}
+  .toast{bottom:28px}
+  .onb{padding-top:72px}
+}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
+<main class="screen" id="scr-onboarding" hidden>
+  <div class="onb">
+    <p class="kicker">Padel à Orléans</p>
+    <h1>Connecte tes clubs</h1>
+    <p class="lead">Pour voir les créneaux libres, connecte ton compte 4PADEL et ton compte Let Padel. Tes identifiants restent chiffrés sur ton ordinateur.</p>
+    <section class="group" id="onbList"></section>
+    <button class="btn-wide dim" id="onbGo" type="button" disabled>Voir les créneaux</button>
+    <p class="foot" id="onbFoot">Encore 2 comptes à connecter.</p>
+  </div>
+</main>
+
 <main class="screen" id="scr-slots">
-  <p class="kicker">Padel à Orléans</p>
-  <div class="titlerow"><h1>Créneaux</h1><button class="pill" id="nowBtn" type="button">Maintenant</button></div>
+  <header class="hdr">
+    <p class="kicker">Padel à Orléans</p>
+    <div class="titlerow"><h1>Créneaux</h1><button class="pill" id="nowBtn" type="button">Maintenant</button></div>
+  </header>
+  <section class="filters" aria-label="Filtres">
   <div class="days" id="days" role="group" aria-label="Jour"></div>
   <section class="group">
     <div class="grow" id="durRow"><span class="glabel">Durée</span>
@@ -1067,6 +1217,8 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
       </div></div>
     <div class="grow"><span class="glabel" id="hoursLbl">Dès</span><div class="hours" id="hours" role="group" aria-label="Heure"></div></div>
   </section>
+  </section>
+  <section class="results">
   <div class="bar">
     <p class="summary" id="summary" aria-live="polite"></p>
     <div class="seg small" id="views" role="group" aria-label="Affichage">
@@ -1077,6 +1229,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   <div id="banners"></div>
   <div id="list"></div>
   <p class="foot" id="foot"></p>
+  </section>
 </main>
 
 <main class="screen" id="scr-accounts" hidden>
@@ -1098,7 +1251,8 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   </section>
 </main>
 
-<nav class="tabbar" role="tablist" aria-label="Sections">
+<nav class="tabbar" id="tabbar" role="tablist" aria-label="Sections">
+  <span class="brand">Padel à Orléans</span>
   <button class="tab" role="tab" id="tab-slots" aria-selected="true" type="button">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/><circle cx="8.5" cy="14.5" r="1" fill="currentColor"/><circle cx="12" cy="14.5" r="1" fill="currentColor"/></svg>
     Créneaux</button>
@@ -1214,6 +1368,7 @@ async function load(){
     const r=await fetch(`/api/slots?date=${iso(dateFor(S.offset))}&duration=${S.dur}`);
     if(!r.ok) throw new Error(`L’outil a répondu ${r.status}.`);
     S.data=await r.json();
+    const n=new Date(); S.at=`${n.getHours()}h${String(n.getMinutes()).padStart(2,"0")}`;
   }catch(e){ S.data=null; S.err="L’outil sur ton PC ne répond pas. Relance lancer_padel.bat."; }
   S.loading=false; render();
 }
@@ -1231,7 +1386,8 @@ function render(){
   const dayTxt = S.offset===0?"aujourd’hui":S.offset===1?"demain":`${DAYS[d.getDay()]} ${d.getDate()}`;
   $("banners").innerHTML=""; 
   if(!LIVE) return renderStatic(d, we, dayTxt);
-  if(S.loading && !S.data){ $("summary").textContent="Recherche des créneaux…"; $("list").innerHTML=""; return; }
+  $("list").className = "v-"+S.view;
+  if(S.loading){ $("summary").textContent="Recherche des créneaux…"; $("list").className=""; $("list").innerHTML='<div class="skel"></div><div class="skel"></div><div class="skel"></div>'; return; }
   if(S.err){ $("summary").textContent=""; $("list").innerHTML=`<div class="empty">${esc(S.err)}</div>`; return; }
 
   const rows=CLUBS.map(c=>({c,...clubState(c)}));
@@ -1245,6 +1401,7 @@ function render(){
   $("summary").textContent = total
     ? `${plural(total,"créneau")} ${total>1?"libres":"libre"} ${dayTxt}, ${plural(nClubs,"club")}`.replace("créneaus","créneaux")
     : `Aucun créneau libre ${dayTxt} dès ${S.t}h`;
+  if(S.at){ $("summary").insertAdjacentHTML("beforeend", `<br>À jour à ${S.at} <button class="refresh" type="button" id="refreshBtn">Actualiser</button>`); }
 
   $("list").innerHTML = S.view==="time" ? renderByTime(rows) : renderByClub(rows);
   wire();
@@ -1299,6 +1456,7 @@ function renderStatic(d, we, dayTxt){
 }
 
 function wire(){
+  const rb=document.getElementById("refreshBtn"); if(rb) rb.onclick=load;
   document.querySelectorAll("[data-book]").forEach(el=>el.onclick=()=>openBooking(el, JSON.parse(el.dataset.book)));
   document.querySelectorAll("[data-connect]").forEach(el=>el.onclick=()=>openSheet(el.dataset.connect));
 }
@@ -1319,6 +1477,41 @@ async function openBooking(el, book){
 }
 
 /* Comptes */
+const checkSVG='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+function acctRow(x, st, onboarding){
+  const until = st.until ? ` jusqu’au ${esc(st.until)}` : "";
+  let status;
+  if(onboarding){
+    status = st.connected ? `<small class="ok">Connecté${until}</small>`
+      : st.saved ? `<small class="ok">Identifiants enregistrés</small>`
+      : `<small>${x.required ? "Obligatoire" : "Facultatif"}</small>`;
+  } else {
+    status = st.connected ? `<small class="ok">Connecté${until}${st.email?` · ${esc(st.email)}`:""}</small>`
+      : st.saved ? `<small>Reconnexion automatique · ${esc(st.email)}</small>`
+      : `<small>${x.required ? "Obligatoire · " : ""}Non connecté</small>`;
+  }
+  const check = onboarding ? `<span class="check${ready(st)?" on":""}">${checkSVG}</span>` : "";
+  return `<div class="acct">${check}<span class="who"><strong>${esc(x.name)}</strong>${status}</span><button class="btn-ghost" type="button" data-connect="${x.id}">${ready(st)?"Modifier":"Connecter"}</button></div>`;
+}
+
+/* Accueil : 4PADEL et Let Padel obligatoires */
+async function checkGate(){
+  try{ S.accounts=await (await fetch("/api/accounts")).json(); }catch(e){ S.accounts=S.accounts||{}; }
+  const a=S.accounts||{};
+  const missing=ACCOUNTS.filter(x=>x.required && !ready(a[x.id]));
+  $("onbList").innerHTML=ACCOUNTS.map(x=>acctRow(x, a[x.id]||{}, true)).join("");
+  $("onbGo").disabled=!!missing.length; $("onbGo").classList.toggle("dim", !!missing.length);
+  $("onbFoot").textContent = missing.length
+    ? (missing.length===2 ? "Encore 2 comptes à connecter." : `Plus que ${missing[0].name} à connecter.`)
+    : "Tout est prêt. Smash Padel peut se connecter plus tard depuis l’onglet Comptes.";
+  wire();
+  return !missing.length;
+}
+async function gate(){
+  const ok=await checkGate();
+  if(ok){ showTab("slots"); load(); }
+  else showTab("onboarding");
+}
 async function refreshAccounts(){
   if(!LIVE){
     $("acctList").innerHTML=`<div class="acct"><span class="who"><strong>Comptes des clubs</strong><small>Ils se gèrent dans l’outil installé sur ton PC.</small></span></div>`;
@@ -1327,12 +1520,7 @@ async function refreshAccounts(){
   }
   try{ S.accounts=await (await fetch("/api/accounts")).json(); }catch(e){ S.accounts={}; }
   const a=S.accounts||{};
-  const line=(id,label)=>{ const x=a[id]||{}; 
-    const status = x.connected ? `<small class="ok">Connecté${x.until?` jusqu’au ${esc(x.until)}`:""}${x.email?` · ${esc(x.email)}`:""}</small>`
-                               : `<small>${x.email?`Session expirée · ${esc(x.email)}`:"Non connecté"}</small>`;
-    return `<div class="acct"><span class="who"><strong>${label}</strong>${status}</span><button class="btn-ghost" type="button" data-connect="${id}">${x.connected?"Modifier":"Connecter"}</button></div>`; };
-  $("acctList").innerHTML = line("4padel","4PADEL Orléans") + line("smash","Smash Padel") +
-    `<div class="acct"><span class="who"><strong>Let Padel</strong><small>Sans compte : créneaux publics</small></span></div>`;
+  $("acctList").innerHTML = ACCOUNTS.map(x=>acctRow(x, a[x.id]||{})).join("");
   $("acctFoot").textContent="Tes identifiants sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire.";
   wire();
 }
@@ -1340,7 +1528,13 @@ async function refreshAccounts(){
 /* Fenêtre de connexion */
 const SHEETS={
   "4padel":{title:"Connecter 4PADEL", key:true},
+  "letpadel":{title:"Connecter Let Padel", key:false},
   "smash":{title:"Connecter Smash Padel", key:false}};
+const ACCOUNTS=[
+  {id:"4padel", name:"4PADEL Orléans", note:"Fleury-les-Aubrais", required:true},
+  {id:"letpadel", name:"Let Padel", note:"Un seul compte pour Saint-Pryvé et Fleury", required:true},
+  {id:"smash", name:"Smash Padel", note:"Saint-Denis-en-Val", required:false}];
+const ready = a => !!a && (a.connected || a.saved);   // identifiants enregistrés : reconnexion automatique
 let PROVIDER="4padel";
 function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:""); }
 async function openSheet(p){
@@ -1354,11 +1548,16 @@ async function openSheet(p){
   if(!S.accounts){ try{ S.accounts=await (await fetch("/api/accounts")).json(); $("cEmail").value=(S.accounts[PROVIDER]||{}).email||""; }catch(e){} }
   ($("cEmail").value?$("cPass"):$("cEmail")).focus();
 }
+async function afterLogin(){
+  $("sheet").close();
+  if(!$("scr-onboarding").hidden){ await checkGate(); return; }
+  load(); refreshAccounts();
+}
 async function follow(){
   for(;;){
     await new Promise(r=>setTimeout(r,1000));
     const st=await (await fetch("/api/login/status")).json();
-    if(st.state==="done"){ setG(st.message,"ok"); setTimeout(()=>{ $("sheet").close(); load(); refreshAccounts(); },900); return; }
+    if(st.state==="done"){ setG(st.message,"ok"); setTimeout(afterLogin,900); return; }
     if(st.state==="error"){ setG(st.message,"bad"); $("gBtn").disabled=false; $("winBtn").disabled=false; return; }
     setG(st.message);
   }
@@ -1385,12 +1584,14 @@ $("tokSave").onclick=async()=>{
   try{
     const r=await fetch("/api/token",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:v})});
     const j=await r.json(); if(!r.ok) throw new Error(j.error||"Enregistrement impossible.");
-    $("sheet").close(); load(); refreshAccounts();
+    afterLogin();
   }catch(e){ $("tokErr").textContent=e.message; }
 };
 
 /* Onglets et réglages */
 function showTab(name){
+  $("scr-onboarding").hidden = name!=="onboarding";
+  $("tabbar").hidden = name==="onboarding";
   $("scr-slots").hidden = name!=="slots"; $("scr-accounts").hidden = name!=="accounts";
   $("tab-slots").setAttribute("aria-selected", name==="slots"); $("tab-accounts").setAttribute("aria-selected", name==="accounts");
   if(name==="accounts") refreshAccounts();
@@ -1404,6 +1605,7 @@ document.querySelectorAll("#defViewSeg button").forEach(b=>b.onclick=()=>{PREFS.
 document.querySelectorAll("#views button").forEach(b=>b.onclick=()=>{S.view=b.dataset.v; press($("views"),x=>x===b); render();});
 document.querySelectorAll("#durs button").forEach(b=>b.onclick=()=>{S.dur=+b.dataset.d; press($("durs"),x=>x===b); load();});
 $("nowBtn").onclick=setNow;
+$("onbGo").onclick=()=>{ showTab("slots"); load(); };
 
 /* Démarrage */
 applyPrefs();
@@ -1416,7 +1618,7 @@ if(!LIVE){
   $("foot").textContent="Prix par joueur. Smash : toucher un horaire ouvre directement la réservation de la piste. Let Padel et 4PADEL : le planning du club s’ouvre, choisis-y l’horaire.";
 }
 const n0=new Date(); S.t=Math.min(22,Math.max(8,n0.getHours())); syncHours();
-load();
+if(LIVE) gate(); else load();
 </script>
 </body>
 </html>
@@ -1424,3 +1626,4 @@ load();
 
 if __name__ == "__main__":
     main()
+
