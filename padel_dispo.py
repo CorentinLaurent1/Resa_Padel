@@ -1,49 +1,60 @@
 #!/usr/bin/env python3
 """
-Padel Orléans : créneaux libres en direct, servis en local.
+Padel Orléans : créneaux libres des clubs d'Orléans, pour tout le monde.
 
-Sur ton PC :  py padel_dispo.py   (ou double-clic sur lancer_padel.bat)
-Puis la page s'ouvre sur http://127.0.0.1:8765
+Chaque visiteur connecte SES comptes (4PADEL, Let Padel, Smash Padel). Ses sessions
+et, s'il le souhaite, ses identifiants sont chiffrés avec une clé qui ne vit que
+dans son navigateur (cookie) : le serveur seul ne peut pas les lire.
 
-Sur un hébergeur (Render…) : la variable PORT est lue automatiquement.
-Définis aussi PADEL_ACCESS (mot de passe d'accès à la page), sinon
-n'importe qui ayant l'adresse peut l'ouvrir. Identifiants des clubs
-possibles par variables : PADEL_4PADEL_EMAIL / PADEL_4PADEL_PASSWORD,
-PADEL_SMASH_EMAIL / PADEL_SMASH_PASSWORD.
+Sur ton PC :       py padel_dispo.py      (ou double-clic sur lancer_padel.bat)
+Sur un hébergeur : la variable PORT est lue automatiquement (Render…).
+Options : PADEL_ACCESS (mot de passe d'accès au site, facultatif),
+          PADEL_DATA_DIR (dossier où garder les données chiffrées).
 
-Python 3.8+ et le module playwright (py -m pip install playwright).
-Rien d'autre à télécharger : le script utilise ton Chrome ou Edge.
-Tes identifiants sont dans identifiants.dat, chiffré par Windows (DPAPI).
-La clé de session 4PADEL reste dans le fichier .4padel_token à côté du script.
+Dépendances : Python 3.8+ et playwright (py -m pip install playwright),
+plus Chrome/Edge sur ton PC, ou « playwright install chromium » sur un serveur.
 """
-import base64, datetime, json, os, re, shutil, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, webbrowser
+import base64, collections, datetime, hashlib, hmac, json, os, re, secrets, shutil, subprocess, sys, threading, time
+import urllib.error, urllib.parse, urllib.request, webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", 8765))
 CLOUD = "PORT" in os.environ                      # lancé par un hébergeur (Render…)
 HOST = os.environ.get("HOST", "0.0.0.0" if CLOUD else "127.0.0.1")
-ACCESS = os.environ.get("PADEL_ACCESS", "")       # mot de passe d'accès à la page
+ACCESS = os.environ.get("PADEL_ACCESS", "")       # mot de passe d'accès au site (facultatif)
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOKEN_FILE = os.path.join(HERE, ".4padel_token")
+DATA_DIR = os.environ.get("PADEL_DATA_DIR", os.path.join(HERE, "donnees"))
+STORE_FILE = os.path.join(DATA_DIR, "utilisateurs.json")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/129.0 Safari/537.36")
 
-# --- Configuration des clubs (relevée dans tes captures HAR) -----------------
-DOINSPORT_PADEL_ACTIVITY = "ce8c306e-224a-4f24-aa9d-6500580924dc"   # « Padel », vu à Fleury
-LETPADEL_CATEGORY = {"letpadel-fleury": "be10916d-f273-4f52-ad9b-da6379dca5c9"}   # vu dans ta 1re capture
+# --- Configuration des clubs (relevée dans les captures HAR) -----------------
+DOINSPORT_PADEL_ACTIVITY = "ce8c306e-224a-4f24-aa9d-6500580924dc"
+LETPADEL_CATEGORY = {"letpadel-fleury": "be10916d-f273-4f52-ad9b-da6379dca5c9"}
 LETPADEL_CLUBS = {
     "letpadel-pryve": "6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f",
     "letpadel-fleury": "fc96f79e-ef94-4fa6-9b01-d494eccaa54f",
 }
+LETPADEL_HOME = "https://letpadel.doinsport.club/home"
 SMASH_BASE = "https://smashpadel.mymobileapp.fr"
 SMASH_SPORT_PADEL = "2"
-SMASH_FILE = os.path.join(HERE, ".smash_session")
-LETPADEL_TOKEN_FILE = os.path.join(HERE, ".letpadel_token")
-LETPADEL_HOME = "https://letpadel.doinsport.club/home"
-FOURPADEL_CENTER_ID = 9        # « LE FIVE Orléans Fleury »
+FOURPADEL_CENTER_ID = 9
 FOURPADEL_SPORT_PADEL = 3
-
+SIGNIN_URL = "https://www.4padel.fr/signin?redirect=%2Freservations%2Fslots"
+API_HOST_MATCH = "lefive.fr"
+SMASH_HOST_MATCH = "smashpadel.mymobileapp.fr"
+DOIN_HOST_MATCH = "doinsport.club"
+LETPADEL_PAGE_MATCH = "letpadel.doinsport.club"
+PROFILE_DIR = os.path.join(HERE, ".chrome-padel")
+CDP_PORT = 9223
+PROVIDER_IDS = ("4padel", "letpadel", "smash")
+PROVIDERS = {
+    "4padel": {"url": SIGNIN_URL, "name": "4PADEL", "hint": "Dans la fenêtre Chrome, connecte-toi à 4PADEL."},
+    "letpadel": {"url": LETPADEL_HOME, "name": "Let Padel", "hint": "Dans la fenêtre Chrome, connecte-toi à Let Padel."},
+    "smash": {"url": SMASH_BASE + "/", "name": "Smash Padel",
+              "hint": "Dans la fenêtre Chrome, connecte-toi à Smash Padel puis ouvre « Nouvelle réservation »."},
+}
 
 class NeedsToken(Exception):
     pass
@@ -69,9 +80,10 @@ def euros(value):
     return (s[:-3] if s.endswith(",00") else s) + " €/joueur"
 
 
-# --- Let Padel (Doinsport) : public, pas besoin de compte ---------------------
 DOIN_HEADERS = {"Origin": "https://letpadel.doinsport.club",
                 "Referer": "https://letpadel.doinsport.club/", "x-locale": "fr"}
+
+
 _ACTIVITY_CACHE = {}
 
 
@@ -129,18 +141,6 @@ def parse_doinsport(j, duration, activity=DOINSPORT_PADEL_ACTIVITY):
     return out
 
 
-# --- 4PADEL (API LE FIVE) : nécessite ta clé de session ------------------------
-def read_token():
-    env = os.environ.get("FOURPADEL_TOKEN")
-    if env:
-        return env.strip()
-    try:
-        with open(TOKEN_FILE, encoding="utf-8") as f:
-            return f.read().strip() or None
-    except FileNotFoundError:
-        return None
-
-
 def jwt_payload(token):
     payload = token.split(" ")[-1].split(".")[1]
     payload += "=" * (-len(payload) % 4)
@@ -165,47 +165,6 @@ def is_doinsport_token(token):
         return False
 
 
-def read_letpadel_token():
-    try:
-        with open(LETPADEL_TOKEN_FILE, encoding="utf-8") as f:
-            return f.read().strip() or None
-    except FileNotFoundError:
-        return None
-
-
-def save_letpadel_token(token):
-    with open(LETPADEL_TOKEN_FILE, "w", encoding="utf-8") as f:
-        f.write(token)
-    try:
-        os.chmod(LETPADEL_TOKEN_FILE, 0o600)
-    except OSError:
-        pass
-
-
-def session_state(provider):
-    """(connecté ?, date d'expiration ou None)"""
-    if provider == "4padel":
-        tok = read_token()
-    elif provider == "letpadel":
-        tok = read_letpadel_token()
-    else:
-        sm = read_smash()
-        return bool(sm and sm.get("token")), None
-    if not tok:
-        return False, None
-    exp = token_expiry(tok)
-    return (exp is None or exp > datetime.datetime.now()), exp
-
-
-def save_token(token):
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-        f.write(token)
-    try:
-        os.chmod(TOKEN_FILE, 0o600)
-    except OSError:
-        pass
-
-
 def token_expiry(token):
     try:
         payload = token.split(" ")[-1].split(".")[1]
@@ -219,35 +178,6 @@ def token_expiry(token):
 def zulu(d, hour, minute=0):
     local = datetime.datetime(d.year, d.month, d.day, hour, minute).astimezone()
     return local.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-
-def fourpadel_slots(date, duration):
-    token = read_token()
-    if not token:
-        raise NeedsToken("Connecte ton compte 4PADEL pour voir ses créneaux.")
-    exp = token_expiry(token)
-    if exp and exp < datetime.datetime.now():
-        raise NeedsToken(f"Ta connexion 4PADEL a expiré le {exp:%d/%m}. Reconnecte-toi.")
-    d = datetime.date.fromisoformat(date)
-    auth = token if " " in token else f"Bearer {token}"
-    headers = {"Authorization": auth, "Origin": "https://www.4padel.fr",
-               "Referer": "https://www.4padel.fr/"}
-    found = []
-    # Le site interroge par fenêtres de quelques heures : on fait pareil.
-    for start in range(8, 23, 2):
-        end = min(start + 2, 23)
-        body = {"startingDateZuluTime": zulu(d, start), "endingDateZuluTime": zulu(d, end),
-                "durations": "60,90,120", "capacity": 4, "center_id": FOURPADEL_CENTER_ID,
-                "bookingType_id": "1", "sportType_id": FOURPADEL_SPORT_PADEL, "isChannelWeb": True,
-                "computePriceWithDefaultCapaIfNoCapa": True}
-        try:
-            found += http_json("https://api2-front.lefive.fr/bookingrules/allFields?appId=2&isChannelWeb=true",
-                               "POST", body, headers)
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                raise NeedsToken("4PADEL a refusé la clé : reconnecte-toi.")
-            raise
-    return parse_fourpadel(found, duration)
 
 
 def parse_fourpadel(items, duration):
@@ -266,47 +196,10 @@ def parse_fourpadel(items, duration):
     return [seen[k] for k in sorted(seen)]
 
 
-
-# --- Smash Padel (Live Xperience) : page HTML, nécessite d'être connecté -------
 SLOT_RE = re.compile(r"""date-countDispo="(\d+)"\s+onclick="choosePop\('(\d\d/\d\d/\d{4} (\d\d:\d\d):\d\d)','([^']*)','([^']*)'""")
+
+
 TOKEN_RE = re.compile(r"livexperience_site_token=([\w-]+)")
-
-
-def read_smash():
-    try:
-        with open(SMASH_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, ValueError):
-        return None
-
-
-def save_smash(data):
-    with open(SMASH_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    try:
-        os.chmod(SMASH_FILE, 0o600)
-    except OSError:
-        pass
-
-
-def smash_slots(date, duration):
-    sess = read_smash()
-    if not sess or not sess.get("token"):
-        raise NeedsToken("Connecte ton compte Smash Padel pour voir ses créneaux.")
-    d = datetime.date.fromisoformat(date)
-    body = urllib.parse.urlencode({
-        "myDate": d.strftime("%d/%m/%Y"), "duree": str(duration), "id_sport": SMASH_SPORT_PADEL,
-        "livexperience_site_token": sess["token"], "dd": str(int(time.time() * 1000)),
-    }).encode()
-    req = urllib.request.Request(f"{SMASH_BASE}/loadcalendrier_capsule.asp", data=body, method="POST")
-    for k, v in {"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                 "X-Requested-With": "XMLHttpRequest", "Origin": SMASH_BASE, "Referer": SMASH_BASE + "/",
-                 "Cookie": sess.get("cookies", "")}.items():
-        if v:
-            req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        html = r.read().decode("utf-8", "replace")
-    return parse_smash(html)
 
 
 def parse_smash(html):
@@ -324,104 +217,12 @@ def parse_smash(html):
     return sorted(out, key=lambda x: x["time"])
 
 
-# --- Identifiants protégés ---------------------------------------------------
-# Sous Windows, le fichier est chiffré avec DPAPI : seul ton compte Windows, sur
-# ce PC, peut le déchiffrer. Ailleurs, il n'est lisible que par ton utilisateur.
-CREDS_FILE = os.path.join(HERE, "identifiants.dat")
-
-
-def _dpapi(data, protect):
-    if os.name != "nt" or not hasattr(__import__("ctypes"), "windll"):
-        raise OSError("chiffrement Windows indisponible sur ce système")
-    import ctypes
-    from ctypes import wintypes
-
-    class BLOB(ctypes.Structure):
-        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-    buf = ctypes.create_string_buffer(data, len(data))
-    inp = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    out = BLOB()
-    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
-    if not fn(ctypes.byref(inp), None, None, None, None, 0x1, ctypes.byref(out)):
-        raise OSError("Windows n’a pas pu " + ("chiffrer" if protect else "déchiffrer") + " les identifiants.")
-    try:
-        return ctypes.string_at(out.pbData, out.cbData)
-    finally:
-        ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
-
-
-def load_creds():
-    creds = {}
-    try:
-        with open(CREDS_FILE, "rb") as f:
-            raw = f.read()
-        kind, _, payload = raw.partition(b"\n")
-        data = base64.b64decode(payload)
-        if kind == b"DPAPI1":
-            data = _dpapi(data, False)
-        creds = json.loads(data.decode("utf-8"))
-    except FileNotFoundError:
-        pass
-    except Exception:
-        # Fichier chiffré par Windows sur un autre ordinateur (ou un autre compte) :
-        # illisible ici, on l'ignore. Il sera remplacé à la prochaine connexion.
-        creds = {}
-    for key, env in (("4padel", "4PADEL"), ("letpadel", "LETPADEL"), ("smash", "SMASH")):   # variables d'environnement prioritaires
-        e, p = os.environ.get(f"PADEL_{env}_EMAIL"), os.environ.get(f"PADEL_{env}_PASSWORD")
-        if e and p:
-            creds[key] = {"email": e, "password": p}
-    return creds
-
-
-def save_creds(creds):
-    # Les identifiants venant des variables d'environnement ne sont jamais écrits sur disque.
-    env_only = {k for k in ("4padel", "letpadel", "smash")
-                if os.environ.get(f"PADEL_{k.upper()}_EMAIL") and os.environ.get(f"PADEL_{k.upper()}_PASSWORD")}
-    data = json.dumps({k: v for k, v in creds.items() if k not in env_only}).encode("utf-8")
-    try:
-        blob = b"DPAPI1\n" + base64.b64encode(_dpapi(data, True))
-    except OSError:
-        blob = b"PLAIN1\n" + base64.b64encode(data)   # hors Windows : lisible par ton seul utilisateur
-    tmp = CREDS_FILE + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(blob)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, CREDS_FILE)
-
-
-# --- Connexion aux clubs -----------------------------------------------------
-# Deux façons :
-#  - automatique : un Chrome invisible remplit le vrai formulaire avec ton e-mail
-#    et ton mot de passe, puis récupère la session (et recommence seul à expiration) ;
-#  - manuelle : une fenêtre Chrome s'ouvre et tu te connectes toi-même (Google…).
-SIGNIN_URL = "https://www.4padel.fr/signin?redirect=%2Freservations%2Fslots"
-API_HOST_MATCH = "lefive.fr"
-SMASH_HOST_MATCH = "smashpadel.mymobileapp.fr"
-DOIN_HOST_MATCH = "doinsport.club"            # API et site Let Padel
-LETPADEL_PAGE_MATCH = "letpadel.doinsport.club"
-PROFILE_DIR = os.path.join(HERE, ".chrome-4padel")
-CDP_PORT = 9223
-LOGIN = {"state": "idle", "message": ""}
-LOGIN_LOCK = threading.Lock()
-BROWSER_LOCK = threading.Lock()
 JWT_RE = re.compile(r"eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+")
+
+
 LS_SCAN = "() => Object.keys(localStorage).map(k => localStorage.getItem(k) || '').join('\n') + '\n' + document.cookie"
 
-PROVIDERS = {
-    "4padel": {"url": SIGNIN_URL, "name": "4PADEL",
-               "hint": "Dans la fenêtre Chrome, connecte-toi à 4PADEL."},
-    "letpadel": {"url": LETPADEL_HOME, "name": "Let Padel",
-                 "hint": "Dans la fenêtre Chrome, connecte-toi à Let Padel."},
-    "smash": {"url": SMASH_BASE + "/", "name": "Smash Padel",
-              "hint": "Dans la fenêtre Chrome, connecte-toi à Smash Padel puis ouvre « Nouvelle réservation »."},
-}
 
-# Repère le champ mot de passe visible et le champ e-mail juste avant lui (en
-# ignorant par exemple le champ « newsletter » du pied de page).
 FIND_FORM_JS = r"""() => {
   const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
@@ -436,6 +237,8 @@ FIND_FORM_JS = r"""() => {
   pw.setAttribute('data-padel', 'pw'); pick.setAttribute('data-padel', 'email');
   return true;
 }"""
+
+
 REVEAL_JS = r"""() => {
   const re = /(e-?mail|adresse|mot de passe|identifi|se connecter|connexion|j'ai déjà un compte|déjà membre|log ?in|sign ?in|mon compte|mon profil)/i;
   const bad = /(google|apple|facebook|inscri|créer|newsletter|abonne)/i;
@@ -444,6 +247,8 @@ REVEAL_JS = r"""() => {
   if (els.length) { els[0].click(); return (els[0].textContent || '').trim().slice(0, 40); }
   return null;
 }"""
+
+
 COOKIE_JS = r"""() => {
   const re = /(tout accepter|accepter|accept all|j'accepte|ok)/i;
   const b = [...document.querySelectorAll('button, a')].find(el => el.offsetParent !== null && re.test((el.textContent||'').trim()));
@@ -470,10 +275,6 @@ def find_chrome():
             if p:
                 cands.append(p)
     return next((c for c in cands if c and os.path.exists(c)), None)
-
-
-def set_login(state, message):
-    LOGIN.update(state=state, message=message)
 
 
 def _attach_capture(ctx, provider, found):
@@ -553,174 +354,6 @@ def _scan(ctx, provider, found):
     return "token" in found and found.get("logged")
 
 
-def _persist(ctx, provider, found):
-    if provider == "letpadel":
-        save_letpadel_token(found["token"])
-        exp = token_expiry(found["token"])
-        return "Connecté à Let Padel" + (f" jusqu’au {exp:%d/%m}." if exp else ".")
-    if provider == "4padel":
-        save_token(found["token"])
-        exp = token_expiry(found["token"])
-        return "Connecté à 4PADEL" + (f" jusqu’au {exp:%d/%m}." if exp else ".")
-    cookies = "; ".join(f"{c['name']}={c['value']}" for c in ctx.cookies(SMASH_BASE + "/"))
-    save_smash({"token": found["token"], "cookies": cookies})
-    return "Connecté à Smash Padel."
-
-
-def auto_login(provider, email, password, report=lambda m: None):
-    """Connexion invisible avec e-mail et mot de passe. Renvoie un message, ou lève une erreur."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise RuntimeError("Il manque un module : lance « py -m pip install playwright » puis relance.")
-    chrome = find_chrome()
-    with BROWSER_LOCK, sync_playwright() as pw:
-        try:
-            browser = pw.chromium.launch(executable_path=chrome, headless=True) if chrome else pw.chromium.launch(headless=True)
-        except Exception:
-            raise RuntimeError("Chrome ou Edge introuvable. Installe Chrome, ou lance « py -m playwright install chromium ».")
-        try:
-            ctx = browser.new_context(locale="fr-FR", user_agent=UA, viewport={"width": 1280, "height": 900})
-            found = {}
-            _attach_capture(ctx, provider, found)
-            pg = ctx.new_page()
-            report("Ouverture de la page de connexion…")
-            pg.goto(PROVIDERS[provider]["url"], wait_until="domcontentloaded", timeout=45000)
-            pg.wait_for_timeout(1500)
-            if _scan(ctx, provider, found) and provider == "smash":
-                return _persist(ctx, provider, found)      # déjà connecté
-            try:
-                pg.evaluate(COOKIE_JS)
-            except Exception:
-                pass
-            # Trouver le formulaire, en cliquant au besoin sur « Se connecter / E-mail ».
-            ok = False
-            for _ in range(4):
-                try:
-                    ok = pg.evaluate(FIND_FORM_JS)
-                except Exception:
-                    ok = False
-                if ok:
-                    break
-                try:
-                    pg.evaluate(REVEAL_JS)
-                except Exception:
-                    pass
-                pg.wait_for_timeout(1500)
-            if not ok:
-                raise RuntimeError("Formulaire de connexion introuvable sur le site du club.")
-            report("Envoi de l’e-mail et du mot de passe…")
-            pg.fill('[data-padel="email"]', email)
-            pg.fill('[data-padel="pw"]', password)
-            pg.press('[data-padel="pw"]', "Enter")
-            deadline = time.time() + 40
-            while time.time() < deadline:
-                pg.wait_for_timeout(1000)
-                if found.get("refused"):
-                    break
-                if _scan(ctx, provider, found):
-                    return _persist(ctx, provider, found)
-                if provider == "smash" and found.get("logged") and "token" not in found:
-                    # Connecté mais jeton pas encore visible : on ouvre la réservation.
-                    try:
-                        pg.evaluate(r"""() => { const a = [...document.querySelectorAll('a,button')].find(e => /r[ée]serv/i.test(e.textContent||'')); if (a) a.click(); }""")
-                    except Exception:
-                        pass
-            raise RuntimeError("Connexion refusée : vérifie l’e-mail et le mot de passe.")
-        finally:
-            browser.close()
-
-
-def interactive_login(provider):
-    """Fenêtre Chrome visible : tu te connectes toi-même (Google, Apple…)."""
-    cfg = PROVIDERS[provider]
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return set_login("error", "Il manque un module : lance « py -m pip install playwright » puis relance.")
-    chrome = find_chrome()
-    if not chrome:
-        return set_login("error", "Chrome, Edge ou Brave introuvable sur cet ordinateur.")
-    proc = subprocess.Popen([chrome, f"--remote-debugging-port={CDP_PORT}", f"--user-data-dir={PROFILE_DIR}",
-                             "--no-first-run", "--no-default-browser-check", "--new-window", cfg["url"]],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        with BROWSER_LOCK, sync_playwright() as pw:
-            browser = None
-            for _ in range(40):
-                try:
-                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-                    break
-                except Exception:
-                    time.sleep(0.5)
-            if not browser:
-                raise RuntimeError("Impossible de piloter Chrome. Ferme toutes ses fenêtres et réessaie.")
-            ctx = browser.contexts[0]
-            found = {}
-            _attach_capture(ctx, provider, found)
-            set_login("waiting", cfg["hint"])
-            deadline = time.time() + 300
-            while time.time() < deadline:
-                pages = [p for p in ctx.pages if not p.is_closed()]
-                if not pages:
-                    raise RuntimeError("La fenêtre Chrome a été fermée avant la connexion.")
-                if _scan(ctx, provider, found):
-                    set_login("done", _persist(ctx, provider, found))
-                    break
-                pages[0].wait_for_timeout(800)
-            else:
-                raise RuntimeError("Pas de connexion détectée en 5 minutes.")
-            try:
-                browser.close()
-            except Exception:
-                pass
-    except Exception as e:
-        set_login("error", str(e) or type(e).__name__)
-    finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-
-
-def credentials_worker(provider):
-    try:
-        c = load_creds().get(provider) or {}
-        msg = auto_login(provider, c["email"], c["password"], lambda m: set_login("waiting", m))
-        set_login("done", msg)
-    except Exception as e:
-        set_login("error", str(e) or type(e).__name__)
-
-
-def start_login(provider, mode):
-    with LOGIN_LOCK:
-        if LOGIN["state"] == "waiting":
-            return False
-        set_login("waiting", "Connexion en cours…")
-        target = credentials_worker if mode == "credentials" else interactive_login
-        threading.Thread(target=target, args=(provider,), daemon=True).start()
-        return True
-
-
-def relogin_if_possible(provider):
-    """Appelé quand une session a expiré : reconnexion silencieuse si on a les identifiants."""
-    try:
-        c = load_creds().get(provider)
-    except Exception:
-        return False
-    if not c:
-        return False
-    try:
-        auto_login(provider, c["email"], c["password"])
-        return True
-    except Exception:
-        return False
-
-
-# --- Ouvrir la réservation d'un créneau --------------------------------------
-# Smash : on ouvre Chrome (profil dédié, déjà connecté) et on fait exactement ce
-# que fait le site quand tu cliques sur un terrain : choose(...) charge
-# /resa-confirm.asp pour ce terrain, cette date et cette durée.
 SMASH_PICK_JS = r"""([ids, stamp]) => {
   for (const id of ids) {
     const b = document.getElementById('terrain_' + id);
@@ -761,16 +394,418 @@ def fill_login(pg, email, password):
         pg.wait_for_timeout(1200)
     return False
 
+# =============================================================================
+#  Espace personnel chiffré de chaque visiteur
+# =============================================================================
+# Le cookie « padel_sid » contient un secret aléatoire. On en dérive :
+#   - l'identifiant de rangement (empreinte : le secret n'est jamais stocké),
+#   - une clé de chiffrement et une clé d'authentification.
+# Chiffrement : flux HMAC-SHA256 en mode compteur + HMAC (encrypt-then-MAC),
+# uniquement avec la bibliothèque standard.
+COOKIE = "padel_sid"
+STORE_LOCK = threading.Lock()
+_STORE = None
 
-def open_smash_booking(stamp, ids, duration):
+
+def _derive(secret):
+    raw = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+    if len(raw) != 32:
+        raise ValueError("cookie invalide")
+    h = lambda label: hashlib.sha256(label + raw).digest()
+    return h(b"padel-id").hex(), h(b"padel-enc"), h(b"padel-mac")
+
+
+def _stream(key, nonce, n):
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hmac.new(key, nonce + i.to_bytes(8, "big"), hashlib.sha256).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+def seal(enc, mac, obj):
+    data = json.dumps(obj, separators=(",", ":")).encode()
+    nonce = secrets.token_bytes(16)
+    ct = bytes(a ^ b for a, b in zip(data, _stream(enc, nonce, len(data))))
+    tag = hmac.new(mac, nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(nonce + ct + tag).decode()
+
+
+def unseal(enc, mac, blob):
+    raw = base64.b64decode(blob)
+    nonce, ct, tag = raw[:16], raw[16:-32], raw[-32:]
+    if not hmac.compare_digest(tag, hmac.new(mac, nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("données altérées")
+    return json.loads(bytes(a ^ b for a, b in zip(ct, _stream(enc, nonce, len(ct)))))
+
+
+def _store():
+    global _STORE
+    if _STORE is None:
+        try:
+            with open(STORE_FILE, encoding="utf-8") as f:
+                _STORE = json.load(f)
+        except (FileNotFoundError, ValueError):
+            _STORE = {}
+    return _STORE
+
+
+def _flush():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_STORE, f)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, STORE_FILE)
+
+
+class Session:
+    """L'espace d'un visiteur. Toutes les données passent par load() / update()."""
+
+    def __init__(self, secret):
+        self.secret = secret
+        self.id, self._enc, self._mac = _derive(secret)
+
+    @classmethod
+    def new(cls):
+        return cls(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))
+
+    def load(self):
+        with STORE_LOCK:
+            blob = _store().get(self.id, {}).get("data")
+        if not blob:
+            return {}
+        try:
+            return unseal(self._enc, self._mac, blob)
+        except Exception:
+            return {}
+
+    def update(self, fn):
+        with STORE_LOCK:
+            st = _store()
+            rec = st.get(self.id, {})
+            try:
+                data = unseal(self._enc, self._mac, rec["data"]) if rec.get("data") else {}
+            except Exception:
+                data = {}
+            fn(data)
+            st[self.id] = {"data": seal(self._enc, self._mac, data), "seen": int(time.time())}
+            _flush()
+            return data
+
+    def forget(self):
+        with STORE_LOCK:
+            if _store().pop(self.id, None) is not None:
+                _flush()
+        LOGINS.pop(self.id, None)
+
+
+def purge_old(days=180):
+    limit = time.time() - days * 86400
+    with STORE_LOCK:
+        st = _store()
+        old = [k for k, v in st.items() if v.get("seen", 0) < limit]
+        for k in old:
+            st.pop(k)
+        if old:
+            _flush()
+
+
+# --- Sessions des clubs dans l'espace du visiteur ------------------------------
+def session_state(data, provider):
+    """(connecté ?, date d'expiration ou None)"""
+    if provider == "smash":
+        sm = data.get("smash") or {}
+        return bool(sm.get("token")), None
+    tok = data.get(provider)
+    if not tok:
+        return False, None
+    exp = token_expiry(tok)
+    return (exp is None or exp > datetime.datetime.now()), exp
+
+
+# =============================================================================
+#  Lecture des créneaux
+# =============================================================================
+_SLOT_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def cached(key, ttl, fn):
+    now = time.time()
+    with _CACHE_LOCK:
+        hit = _SLOT_CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    val = fn()
+    with _CACHE_LOCK:
+        _SLOT_CACHE[key] = (now, val)
+        if len(_SLOT_CACHE) > 500:
+            for k in sorted(_SLOT_CACHE, key=lambda k: _SLOT_CACHE[k][0])[:250]:
+                _SLOT_CACHE.pop(k, None)
+    return val
+
+
+def fourpadel_slots(data, date, duration):
+    token = data.get("4padel")
+    if not token:
+        raise NeedsToken("Connecte ton compte 4PADEL pour voir ses créneaux.")
+    exp = token_expiry(token)
+    if exp and exp < datetime.datetime.now():
+        raise NeedsToken(f"Ta connexion 4PADEL a expiré le {exp:%d/%m}. Reconnecte-toi.")
+    d = datetime.date.fromisoformat(date)
+    auth = token if " " in token else f"Bearer {token}"
+    headers = {"Authorization": auth, "Origin": "https://www.4padel.fr", "Referer": "https://www.4padel.fr/"}
+    found = []
+    for start in range(8, 23, 2):
+        end = min(start + 2, 23)
+        body = {"startingDateZuluTime": zulu(d, start), "endingDateZuluTime": zulu(d, end),
+                "durations": "60,90,120", "capacity": 4, "center_id": FOURPADEL_CENTER_ID,
+                "bookingType_id": "1", "sportType_id": FOURPADEL_SPORT_PADEL, "isChannelWeb": True,
+                "computePriceWithDefaultCapaIfNoCapa": True}
+        try:
+            found += http_json("https://api2-front.lefive.fr/bookingrules/allFields?appId=2&isChannelWeb=true",
+                               "POST", body, headers)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise NeedsToken("4PADEL a refusé la connexion : reconnecte-toi.")
+            raise
+    return parse_fourpadel(found, duration)
+
+
+def smash_slots(data, date, duration):
+    sess = data.get("smash") or {}
+    if not sess.get("token"):
+        raise NeedsToken("Connecte ton compte Smash Padel pour voir ses créneaux.")
+    d = datetime.date.fromisoformat(date)
+    body = urllib.parse.urlencode({
+        "myDate": d.strftime("%d/%m/%Y"), "duree": str(duration), "id_sport": SMASH_SPORT_PADEL,
+        "livexperience_site_token": sess["token"], "dd": str(int(time.time() * 1000)),
+    }).encode()
+    req = urllib.request.Request(f"{SMASH_BASE}/loadcalendrier_capsule.asp", data=body, method="POST")
+    for k, v in {"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                 "X-Requested-With": "XMLHttpRequest", "Origin": SMASH_BASE, "Referer": SMASH_BASE + "/",
+                 "Cookie": sess.get("cookies", "")}.items():
+        if v:
+            req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        html = r.read().decode("utf-8", "replace")
+    return parse_smash(html)
+
+
+# =============================================================================
+#  Connexion aux clubs (navigateur invisible)
+# =============================================================================
+LOGINS = {}                                   # état de connexion par visiteur
+BROWSERS = threading.BoundedSemaphore(int(os.environ.get("PADEL_BROWSERS", "2")))
+VISIBLE_LOCK = threading.Lock()
+_ATTEMPTS = collections.defaultdict(collections.deque)
+
+
+def rate_ok(key, limit=8, window=600):
+    """Limite les tentatives de connexion (par visiteur et par adresse IP)."""
+    q = _ATTEMPTS[key]
+    now = time.time()
+    while q and now - q[0] > window:
+        q.popleft()
+    if len(q) >= limit:
+        return False
+    q.append(now)
+    return True
+
+
+def set_login(sid, state, message):
+    LOGINS[sid] = {"state": state, "message": message}
+
+
+def _extract(ctx, provider, found):
+    """Ce qu'on garde de la connexion : jamais le mot de passe, seulement la session du club."""
+    if provider == "smash":
+        cookies = "; ".join(f"{c['name']}={c['value']}" for c in ctx.cookies(SMASH_BASE + "/"))
+        return {"token": found["token"], "cookies": cookies}
+    return found["token"]
+
+
+def _done_message(provider, value):
+    name = PROVIDERS[provider]["name"]
+    exp = token_expiry(value) if isinstance(value, str) else None
+    return f"Connecté à {name}" + (f" jusqu’au {exp:%d/%m}." if exp else ".")
+
+
+def auto_login(provider, email, password, report=lambda m: None):
+    """Connexion invisible avec e-mail et mot de passe. Renvoie la session du club."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Le module playwright n’est pas installé sur ce serveur.")
+    chrome = find_chrome()
+    report("En attente d’un navigateur libre…")
+    with BROWSERS, sync_playwright() as pw:
+        try:
+            browser = (pw.chromium.launch(executable_path=chrome, headless=True) if chrome
+                       else pw.chromium.launch(headless=True))
+        except Exception:
+            raise RuntimeError("Aucun navigateur disponible : installe Chrome, ou lance « playwright install chromium ».")
+        try:
+            ctx = browser.new_context(locale="fr-FR", user_agent=UA, viewport={"width": 1280, "height": 900})
+            found = {}
+            _attach_capture(ctx, provider, found)
+            pg = ctx.new_page()
+            report("Ouverture de la page de connexion…")
+            pg.goto(PROVIDERS[provider]["url"], wait_until="domcontentloaded", timeout=45000)
+            pg.wait_for_timeout(1500)
+            try:
+                pg.evaluate(COOKIE_JS)
+            except Exception:
+                pass
+            ok = False
+            for _ in range(4):
+                try:
+                    ok = pg.evaluate(FIND_FORM_JS)
+                except Exception:
+                    ok = False
+                if ok:
+                    break
+                try:
+                    pg.evaluate(REVEAL_JS)
+                except Exception:
+                    pass
+                pg.wait_for_timeout(1500)
+            if not ok:
+                raise RuntimeError("Formulaire de connexion introuvable sur le site du club.")
+            report("Envoi de l’e-mail et du mot de passe…")
+            pg.fill('[data-padel="email"]', email)
+            pg.fill('[data-padel="pw"]', password)
+            pg.press('[data-padel="pw"]', "Enter")
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                pg.wait_for_timeout(1000)
+                if found.get("refused"):
+                    break
+                if _scan(ctx, provider, found):
+                    return _extract(ctx, provider, found)
+                if provider == "smash" and found.get("logged") and "token" not in found:
+                    try:
+                        pg.evaluate(r"""() => { const a = [...document.querySelectorAll('a,button')].find(e => /r[ée]serv/i.test(e.textContent||'')); if (a) a.click(); }""")
+                    except Exception:
+                        pass
+            raise RuntimeError("Connexion refusée : vérifie l’e-mail et le mot de passe.")
+        finally:
+            browser.close()
+
+
+def store_login(sess, provider, value, email, password, remember):
+    def fn(d):
+        d[provider] = value
+        d.setdefault("emails", {})[provider] = email
+        creds = d.setdefault("creds", {})
+        if remember and password:
+            creds[provider] = {"email": email, "password": password}
+        else:
+            creds.pop(provider, None)
+    sess.update(fn)
+
+
+def credentials_worker(sess, provider, email, password, remember):
+    try:
+        value = auto_login(provider, email, password, lambda m: set_login(sess.id, "waiting", m))
+        store_login(sess, provider, value, email, password, remember)
+        set_login(sess.id, "done", _done_message(provider, value))
+    except Exception as e:
+        set_login(sess.id, "error", str(e) or type(e).__name__)
+
+
+def interactive_login(sess, provider):
+    """Sur ton PC uniquement : fenêtre Chrome visible, tu te connectes toi-même (Google…)."""
+    cfg = PROVIDERS[provider]
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return set_login(sess.id, "error", "Il manque un module : lance « py -m pip install playwright » puis relance.")
+    chrome = find_chrome()
+    if not chrome:
+        return set_login(sess.id, "error", "Chrome, Edge ou Brave introuvable sur cet ordinateur.")
+    proc = subprocess.Popen([chrome, f"--remote-debugging-port={CDP_PORT}", f"--user-data-dir={PROFILE_DIR}",
+                             "--no-first-run", "--no-default-browser-check", "--new-window", cfg["url"]],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        with VISIBLE_LOCK, sync_playwright() as pw:
+            browser = None
+            for _ in range(40):
+                try:
+                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            if not browser:
+                raise RuntimeError("Impossible de piloter Chrome. Ferme toutes ses fenêtres et réessaie.")
+            ctx = browser.contexts[0]
+            found = {}
+            _attach_capture(ctx, provider, found)
+            set_login(sess.id, "waiting", cfg["hint"])
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                pages = [p for p in ctx.pages if not p.is_closed()]
+                if not pages:
+                    raise RuntimeError("La fenêtre Chrome a été fermée avant la connexion.")
+                if _scan(ctx, provider, found):
+                    value = _extract(ctx, provider, found)
+                    sess.update(lambda d: d.__setitem__(provider, value))
+                    set_login(sess.id, "done", _done_message(provider, value))
+                    break
+                pages[0].wait_for_timeout(800)
+            else:
+                raise RuntimeError("Pas de connexion détectée en 5 minutes.")
+            try:
+                browser.close()
+            except Exception:
+                pass
+    except Exception as e:
+        set_login(sess.id, "error", str(e) or type(e).__name__)
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def start_login(sess, provider, target, *args):
+    cur = LOGINS.get(sess.id, {})
+    if cur.get("state") == "waiting":
+        return False
+    set_login(sess.id, "waiting", "Connexion en cours…")
+    threading.Thread(target=target, args=(sess, provider) + args, daemon=True).start()
+    return True
+
+
+def relogin_if_possible(sess, data, provider):
+    """Session expirée : reconnexion silencieuse si le visiteur a choisi « Rester connecté »."""
+    c = (data.get("creds") or {}).get(provider)
+    if not c:
+        return None
+    try:
+        value = auto_login(provider, c["email"], c["password"])
+    except Exception:
+        return None
+    store_login(sess, provider, value, c["email"], c["password"], True)
+    return sess.load()
+
+
+# --- Ouvrir la réservation d'une piste Smash (sur ton PC uniquement) -----------
+def open_smash_booking(sess, stamp, ids, duration):
     from playwright.sync_api import sync_playwright
+    data = sess.load()
     day = stamp.split(" ")[0]
-    with BROWSER_LOCK, sync_playwright() as pw:
+    with VISIBLE_LOCK, sync_playwright() as pw:
         browser, fresh = visible_browser(pw, SMASH_BASE + "/")
         ctx = browser.contexts[0]
-        sess = read_smash() or {}
+        sm = data.get("smash") or {}
         cookies = []
-        for part in (sess.get("cookies") or "").split(";"):
+        for part in (sm.get("cookies") or "").split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
                 cookies.append({"name": k, "value": v, "url": SMASH_BASE + "/"})
@@ -781,7 +816,7 @@ def open_smash_booking(stamp, ids, duration):
         pg.goto(SMASH_BASE + "/", wait_until="domcontentloaded", timeout=45000)
         pg.wait_for_timeout(1200)
         if "logout.asp" not in pg.content():
-            c = (load_creds() or {}).get("smash")
+            c = (data.get("creds") or {}).get("smash")
             if not c or not fill_login(pg, c["email"], c["password"]):
                 pg.bring_to_front()
                 return "Connecte-toi dans la fenêtre Chrome, puis reclique sur l’horaire."
@@ -796,23 +831,27 @@ def open_smash_booking(stamp, ids, duration):
         pg.bring_to_front()
         if not name:
             return "Ce créneau vient d’être pris. Choisis-en un autre."
-        try:   # le site charge la confirmation une demi-seconde après le choix du terrain
+        try:
             pg.wait_for_function("() => !document.getElementById('terrain_" + ids[0] + "')", timeout=10000)
         except Exception:
             return "La page de confirmation tarde à s’afficher : regarde la fenêtre Chrome."
         return f"Réservation ouverte : {name.strip()} à {stamp[11:16].replace(':', 'h')}."
 
 
-# --- Agrégation --------------------------------------------------------------
-def run(fn, *args, provider=None):
+# =============================================================================
+#  Agrégation
+# =============================================================================
+def run(sess, data, provider, fn, *args):
     try:
-        return {"status": "ok", "slots": fn(*args)}
+        return {"status": "ok", "slots": fn(data, *args) if provider else fn(*args)}
     except NeedsToken as e:
-        if provider and relogin_if_possible(provider):
-            try:
-                return {"status": "ok", "slots": fn(*args)}
-            except Exception:
-                pass
+        if provider:
+            fresh = relogin_if_possible(sess, data, provider)
+            if fresh:
+                try:
+                    return {"status": "ok", "slots": fn(fresh, *args)}
+                except Exception:
+                    pass
         return {"status": "needs_token", "message": str(e)}
     except urllib.error.HTTPError as e:
         return {"status": "error", "message": f"Le club a répondu {e.code}."}
@@ -820,53 +859,94 @@ def run(fn, *args, provider=None):
         return {"status": "error", "message": f"Pas de réponse ({type(e).__name__})."}
 
 
-def keep_sessions_alive():
-    for provider in ("letpadel",):
-        ok, _ = session_state(provider)
-        if not ok and (load_creds_safe().get(provider)):
-            threading.Thread(target=relogin_if_possible, args=(provider,), daemon=True).start()
+def keep_letpadel_alive(sess, data):
+    ok, _ = session_state(data, "letpadel")
+    if not ok and (data.get("creds") or {}).get("letpadel"):
+        threading.Thread(target=relogin_if_possible, args=(sess, data, "letpadel"), daemon=True).start()
 
 
-def load_creds_safe():
-    try:
-        return load_creds()
-    except Exception:
-        return {}
-
-
-def all_slots(date, duration):
-    keep_sessions_alive()
-    jobs = {"4padel": (fourpadel_slots, date, duration), "smash": (smash_slots, date, duration)}
+def all_slots(sess, date, duration):
+    data = sess.load()
+    keep_letpadel_alive(sess, data)
+    jobs = {"4padel": ("4padel", fourpadel_slots, date, duration),
+            "smash": ("smash", smash_slots, date, duration)}
     for key, cid in LETPADEL_CLUBS.items():
-        if cid:
-            jobs[key] = (letpadel_slots, cid, date, duration)
+        # Créneaux Let Padel publics : partagés entre visiteurs pendant 60 s.
+        jobs[key] = (None, lambda c=cid: cached(("lp", c, date, duration), 60, lambda: letpadel_slots(c, date, duration)))
     with ThreadPoolExecutor(max_workers=5) as ex:
-        futs = {k: ex.submit(run, *v, provider=k if k in PROVIDERS else None) for k, v in jobs.items()}
+        futs = {k: ex.submit(run, sess, data, *v) for k, v in jobs.items()}
         clubs = {k: f.result() for k, f in futs.items()}
     for key, cid in LETPADEL_CLUBS.items():
-        if cid and key in clubs:
-            clubs[key]["book_url"] = letpadel_url(key, cid)
-    if CLOUD:   # sur un serveur, impossible d'ouvrir Chrome chez toi : lien vers le site du club
+        clubs[key]["book_url"] = letpadel_url(key, cid)
+    if CLOUD:   # sur un serveur, impossible d'ouvrir Chrome chez le visiteur : lien vers le site du club
         for slot in clubs.get("smash", {}).get("slots", []) or []:
             slot.pop("book", None)
     return {"date": date, "duration": duration, "clubs": clubs}
 
 
-# --- Serveur local -----------------------------------------------------------
+def accounts(data):
+    out = {}
+    for p in PROVIDER_IDS:
+        ok, exp = session_state(data, p)
+        out[p] = {"email": (data.get("emails") or {}).get(p, ""), "connected": ok,
+                  "until": f"{exp:%d/%m}" if ok and exp else None,
+                  "saved": bool((data.get("creds") or {}).get(p))}
+    return out
+
+
+# =============================================================================
+#  Serveur web
+# =============================================================================
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send(self, code, body, ctype="application/json; charset=utf-8"):
+    # --- outils
+    def session(self):
+        """Espace du visiteur, d'après son cookie (créé au besoin)."""
+        self._new_cookie = None
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE and v:
+                try:
+                    return Session(v)
+                except Exception:
+                    break
+        s = Session.new()
+        self._new_cookie = s.secret
+        return s
+
+    def https(self):
+        return CLOUD or self.headers.get("X-Forwarded-Proto", "") == "https"
+
+    def send(self, code, body, ctype="application/json; charset=utf-8", clear_cookie=False):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        flags = "; HttpOnly; SameSite=Lax; Path=/" + ("; Secure" if self.https() else "")
+        if clear_cookie:
+            self.send_header("Set-Cookie", f"{COOKIE}=; Max-Age=0" + flags)
+        elif getattr(self, "_new_cookie", None):
+            self.send_header("Set-Cookie", f"{COOKIE}={self._new_cookie}; Max-Age={180 * 86400}" + flags)
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
+    def body(self):
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        if n > 20000:
+            raise ValueError("trop gros")
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def client_ip(self):
+        fwd = self.headers.get("X-Forwarded-For", "")
+        return fwd.split(",")[0].strip() if fwd else self.client_address[0]
+
     def allowed(self):
-        """Mot de passe d'accès (PADEL_ACCESS) demandé par le navigateur quand il est défini."""
         if not ACCESS:
             return True
         auth = self.headers.get("Authorization", "")
@@ -886,15 +966,15 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not origin:
             return True
-        host = self.headers.get("Host", "")
-        return urllib.parse.urlparse(origin).netloc in (host, f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+        return urllib.parse.urlparse(origin).netloc in (self.headers.get("Host", ""), f"127.0.0.1:{PORT}", f"localhost:{PORT}")
 
+    # --- GET
     def do_GET(self):
         if not self.allowed():
             return
         u = urllib.parse.urlparse(self.path)
+        sess = self.session()
         if u.path == "/":
-            # Forçage fiable du mode LIVE (créneaux en direct) sur la page servie par le script
             html = PAGE.replace("const LIVE = window.PADEL_LIVE === true;",
                                 "const LIVE = true;" + (" window.PADEL_CLOUD = true;" if CLOUD else ""), 1)
             return self.send(200, html.encode(), "text/html; charset=utf-8")
@@ -906,85 +986,80 @@ class Handler(BaseHTTPRequestHandler):
                 assert duration in (60, 90, 120)
             except Exception:
                 return self.send(400, {"error": "Paramètres invalides."})
-            return self.send(200, all_slots(date, duration))
+            return self.send(200, all_slots(sess, date, duration))
         if u.path == "/api/login/status":
-            return self.send(200, LOGIN)
+            return self.send(200, LOGINS.get(sess.id, {"state": "idle", "message": ""}))
         if u.path == "/api/accounts":
-            creds = load_creds_safe()
-            out = {}
-            for p in ("4padel", "letpadel", "smash"):
-                ok, exp = session_state(p)
-                out[p] = {"email": (creds.get(p) or {}).get("email", ""), "connected": ok,
-                          "until": f"{exp:%d/%m}" if ok and exp else None, "saved": bool(creds.get(p))}
-            return self.send(200, out)
+            return self.send(200, accounts(sess.load()))
         self.send(404, {"error": "Introuvable."})
 
+    # --- POST
     def do_POST(self):
         if not self.allowed():
             return
         if not self.same_origin():
             return self.send(403, {"error": "Origine refusée."})
-        if self.path.startswith("/api/login/start"):
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            provider = q.get("p", ["4padel"])[0]
+        sess = self.session()
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            j = self.body()
+        except Exception:
+            return self.send(400, {"error": "Requête invalide."})
+
+        if path == "/api/credentials":
+            provider = j.get("provider")
+            email, password = str(j.get("email", "")).strip(), str(j.get("password", ""))
+            if provider not in PROVIDERS or "@" not in email or not password or len(email) > 200 or len(password) > 200:
+                return self.send(400, {"error": "E-mail ou mot de passe manquant."})
+            if not (rate_ok("s:" + sess.id) and rate_ok("ip:" + self.client_ip(), limit=20)):
+                return self.send(429, {"error": "Trop de tentatives. Réessaie dans quelques minutes."})
+            if not start_login(sess, provider, credentials_worker, email, password, bool(j.get("remember", True))):
+                return self.send(409, {"error": "Une connexion est déjà en cours, patiente un instant."})
+            return self.send(200, LOGINS[sess.id])
+
+        if path == "/api/login/window":
+            if CLOUD:
+                return self.send(400, {"error": "Sur le site en ligne, connecte-toi avec ton e-mail et ton mot de passe."})
+            provider = j.get("provider")
             if provider not in PROVIDERS:
                 return self.send(400, {"error": "Club inconnu."})
-            mode = q.get("mode", ["window"])[0]
-            if CLOUD and mode == "window":
-                return self.send(400, {"error": "Sur le serveur, utilise l’e-mail et le mot de passe."})
-            start_login(provider, mode)
-            return self.send(200, LOGIN)
-        if self.path == "/api/open":
+            start_login(sess, provider, interactive_login)
+            return self.send(200, LOGINS[sess.id])
+
+        if path == "/api/disconnect":
+            provider = j.get("provider")
+            if provider not in PROVIDERS:
+                return self.send(400, {"error": "Club inconnu."})
+            def fn(d):
+                d.pop(provider, None)
+                (d.get("creds") or {}).pop(provider, None)
+            sess.update(fn)
+            return self.send(200, {"ok": True})
+
+        if path == "/api/forget":
+            sess.forget()
+            return self.send(200, {"ok": True}, clear_cookie=True)
+
+        if path == "/api/open":
             if CLOUD:
                 return self.send(400, {"error": "Ouverture directe possible seulement sur ton PC."})
             try:
-                n = int(self.headers.get("Content-Length", "0"))
-                j = json.loads(self.rfile.read(n))
                 stamp, ids, duration = j["date"], [str(int(x)) for x in j["courts"]], int(j["duration"])
                 assert re.fullmatch(r"\d\d/\d\d/\d{4} \d\d:\d\d:\d\d", stamp) and ids and duration in (60, 90, 120)
             except Exception:
                 return self.send(400, {"error": "Créneau invalide."})
             try:
-                return self.send(200, {"message": open_smash_booking(stamp, ids, duration)})
+                return self.send(200, {"message": open_smash_booking(sess, stamp, ids, duration)})
             except Exception as e:
                 return self.send(500, {"error": f"Ouverture impossible ({str(e) or type(e).__name__})."})
-        if self.path == "/api/credentials":
-            try:
-                n = int(self.headers.get("Content-Length", "0"))
-                j = json.loads(self.rfile.read(n))
-                provider, email, password = j["provider"], j["email"].strip(), j["password"]
-                assert provider in PROVIDERS and "@" in email and password and len(email) < 200 and len(password) < 200
-            except Exception:
-                return self.send(400, {"error": "E-mail ou mot de passe manquant."})
-            try:
-                creds = load_creds()
-                creds[provider] = {"email": email, "password": password}
-                save_creds(creds)
-            except Exception as e:
-                return self.send(500, {"error": str(e)})
-            if not start_login(provider, "credentials"):
-                return self.send(409, {"error": "Une connexion est déjà en cours, réessaie dans un instant."})
-            return self.send(200, LOGIN)
-        if self.path != "/api/token":
-            return self.send(404, {"error": "Introuvable."})
-        try:
-            n = int(self.headers.get("Content-Length", "0"))
-            token = json.loads(self.rfile.read(n))["token"].strip()
-            assert token.count(".") == 2 and len(token) < 4000
-        except Exception:
-            return self.send(400, {"error": "Clé invalide."})
-        if not is_4padel_token(token):
-            return self.send(400, {"error": "Cette clé ne vient pas de 4PADEL (c’est peut-être celle de Google)."})
-        save_token(token)
-        exp = token_expiry(token)
-        self.send(200, {"ok": True, "expires": exp.isoformat() if exp else None})
+
+        self.send(404, {"error": "Introuvable."})
 
 
 def main():
+    purge_old()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Padel Orléans tourne sur le port {PORT}  (Ctrl+C pour arrêter)")
-    if HOST != "127.0.0.1" and not ACCESS:
-        print("Attention : page accessible depuis l'extérieur sans mot de passe. Définis PADEL_ACCESS.")
     if not CLOUD:
         url = f"http://127.0.0.1:{PORT}"
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
@@ -1135,6 +1210,11 @@ dialog::backdrop{background:rgba(0,0,0,.35)}
 .manual code{font-size:.85em;background:var(--fill);padding:1px 5px;border-radius:5px}
 .manual textarea{width:100%;min-height:80px;border:0;border-radius:12px;background:var(--bg);color:var(--ink);font:13px ui-monospace,Menlo,Consolas,monospace;padding:10px;resize:vertical;margin-top:8px}
 .rowend{display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
+.remember{display:flex;gap:12px;align-items:flex-start;margin-top:16px;cursor:pointer}
+.remember input{width:20px;height:20px;margin:2px 0 0;accent-color:var(--accent);flex:0 0 auto}
+.remember b{display:block;font-weight:600;font-size:.95rem}
+.remember small{display:block;color:var(--muted);font-size:.82rem;line-height:1.35;margin-top:2px}
+.danger{border:0;background:none;color:var(--red);font-weight:600;font-size:.95rem;padding:14px;width:100%;border-radius:14px;background:var(--card);cursor:pointer;margin-top:22px}
 .err{color:var(--red);font-size:.86rem;min-height:1.1em;margin:6px 0 0}
 
 .toast{position:fixed;left:0;right:0;margin:0 auto;width:fit-content;max-width:min(92vw,440px);z-index:30;
@@ -1203,10 +1283,11 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   <div class="onb">
     <p class="kicker">Padel à Orléans</p>
     <h1>Connecte tes clubs</h1>
-    <p class="lead">Pour voir les créneaux libres, connecte ton compte 4PADEL et ton compte Let Padel. Tes identifiants restent chiffrés sur ton ordinateur.</p>
+    <p class="lead">Connecte ton compte 4PADEL et ton compte Let Padel pour voir leurs créneaux libres. Pas encore de compte ? Crée-le sur le site du club, c’est gratuit.</p>
     <section class="group" id="onbList"></section>
     <button class="btn-wide dim" id="onbGo" type="button" disabled>Voir les créneaux</button>
     <p class="foot" id="onbFoot">Encore 2 comptes à connecter.</p>
+    <p class="foot">Tes connexions sont chiffrées avec une clé gardée dans ton navigateur. Tu peux tout supprimer depuis l’onglet Comptes.</p>
   </div>
 </main>
 
@@ -1246,6 +1327,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   <div class="titlerow"><h1>Comptes</h1></div>
   <section class="group" id="acctList"></section>
   <p class="foot" id="acctFoot"></p>
+  <button class="danger" id="forgetBtn" type="button">Supprimer mes données</button>
   <h3 class="gtitle">Apparence</h3>
   <section class="group">
     <div class="grow"><span class="glabel">Thème</span>
@@ -1276,18 +1358,13 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
     <p class="sub" id="sheetText"></p>
     <label class="field"><span>E-mail</span><input type="email" id="cEmail" autocomplete="username" required></label>
     <label class="field"><span>Mot de passe</span><input type="password" id="cPass" autocomplete="current-password" required></label>
+    <label class="remember"><input type="checkbox" id="cRemember" checked><span><b>Rester connecté</b><small>Reconnexion automatique quand la session du club expire. Ton mot de passe est chiffré avec une clé gardée dans ton navigateur.</small></span></label>
     <button class="btn-wide" id="gBtn" type="submit">Se connecter</button>
     <p class="status" id="gMsg" aria-live="polite"></p>
     <details class="manual" id="manual">
-      <summary>Autres façons de se connecter</summary>
-      <p class="sub" style="margin-top:8px">Compte créé avec Google, sans mot de passe ? Connecte-toi toi-même dans une fenêtre Chrome :</p>
+      <summary>Compte créé avec Google, sans mot de passe ?</summary>
+      <p class="sub" style="margin-top:8px" id="noPwText"></p>
       <div class="rowend" style="justify-content:flex-start"><button class="btn-ghost" id="winBtn" type="button">Ouvrir une fenêtre Chrome</button></div>
-      <div id="keyBox">
-        <p class="sub" style="margin-top:14px">Ou colle la valeur d’<code>authorization</code> copiée dans les outils du navigateur (F12, Réseau) :</p>
-        <textarea id="tok" placeholder="eyJraWQiOi…" spellcheck="false" autocomplete="off"></textarea>
-        <p class="err" id="tokErr"></p>
-        <div class="rowend"><button class="btn-ghost" id="tokSave" type="button">Enregistrer la clé</button></div>
-      </div>
     </details>
     <div class="rowend"><button class="btn-ghost" id="sheetClose" type="button">Fermer</button></div>
   </form>
@@ -1525,20 +1602,20 @@ async function refreshAccounts(){
   if(!LIVE){
     $("acctList").innerHTML=`<div class="acct"><span class="who"><strong>Comptes des clubs</strong><small>Ils se gèrent dans l’outil installé sur ton PC.</small></span></div>`;
     $("acctFoot").textContent="Cette page en ligne affiche les horaires d’ouverture. Les créneaux libres s’affichent dans l’outil lancé avec lancer_padel.bat.";
-    $("viewTitle").hidden=true; $("viewGroup").hidden=true; return;
+    $("viewTitle").hidden=true; $("viewGroup").hidden=true; $("forgetBtn").hidden=true; return;
   }
   try{ S.accounts=await (await fetch("/api/accounts")).json(); }catch(e){ S.accounts={}; }
   const a=S.accounts||{};
   $("acctList").innerHTML = ACCOUNTS.map(x=>acctRow(x, a[x.id]||{})).join("");
-  $("acctFoot").textContent="Tes identifiants sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire.";
+  $("acctFoot").textContent="Tes connexions sont chiffrées avec une clé gardée dans ce navigateur : personne d’autre, pas même le serveur seul, ne peut les lire. Sur un autre appareil, reconnecte tes comptes.";
   wire();
 }
 
 /* Fenêtre de connexion */
 const SHEETS={
-  "4padel":{title:"Connecter 4PADEL", key:true},
-  "letpadel":{title:"Connecter Let Padel", key:false},
-  "smash":{title:"Connecter Smash Padel", key:false}};
+  "4padel":{title:"Connecter 4PADEL", club:"4PADEL"},
+  "letpadel":{title:"Connecter Let Padel", club:"Let Padel"},
+  "smash":{title:"Connecter Smash Padel", club:"Smash Padel"}};
 const ACCOUNTS=[
   {id:"4padel", name:"4PADEL Orléans", note:"Fleury-les-Aubrais", required:true},
   {id:"letpadel", name:"Let Padel", note:"Un seul compte pour Saint-Pryvé et Fleury", required:true},
@@ -1549,9 +1626,15 @@ function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="stat
 async function openSheet(p){
   PROVIDER=SHEETS[p]?p:"4padel"; const c=SHEETS[PROVIDER];
   $("sheetTitle").textContent=c.title;
-  $("sheetText").textContent="Ton e-mail et ton mot de passe sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire.";
-  $("keyBox").hidden=!c.key; $("manual").open=false; $("winBtn").parentElement.hidden=!!window.PADEL_CLOUD; $("winBtn").parentElement.previousElementSibling.hidden=!!window.PADEL_CLOUD;
-  $("cPass").value=""; $("tok").value=""; $("tokErr").textContent=""; setG(""); $("gBtn").disabled=false; $("winBtn").disabled=false;
+  $("sheetText").textContent=`Utilise l’e-mail et le mot de passe de ton compte ${c.club}, ceux que tu tapes sur son site.`;
+  $("manual").open=false;
+  $("noPwText").textContent = window.PADEL_CLOUD
+    ? `Crée un mot de passe avec « Mot de passe oublié » sur le site ${c.club}, puis reviens ici.`
+    : "Crée un mot de passe avec « Mot de passe oublié » sur le site du club, ou connecte-toi toi-même dans une fenêtre Chrome :";
+  $("winBtn").parentElement.hidden=!!window.PADEL_CLOUD;
+  const saved=((S.accounts||{})[PROVIDER]||{});
+  $("cRemember").checked = saved.email ? !!saved.saved : true;
+  $("cPass").value=""; setG(""); $("gBtn").disabled=false; $("winBtn").disabled=false;
   $("cEmail").value=((S.accounts||{})[PROVIDER]||{}).email||"";
   $("sheet").showModal();
   if(!S.accounts){ try{ S.accounts=await (await fetch("/api/accounts")).json(); $("cEmail").value=(S.accounts[PROVIDER]||{}).email||""; }catch(e){} }
@@ -1576,27 +1659,17 @@ $("credForm").onsubmit=async e=>{
   e.preventDefault(); $("gBtn").disabled=true; setG("Connexion en cours…");
   try{
     const r=await fetch("/api/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({provider:PROVIDER,email:$("cEmail").value,password:$("cPass").value})});
+      body:JSON.stringify({provider:PROVIDER,email:$("cEmail").value,password:$("cPass").value,remember:$("cRemember").checked})});
     $("cPass").value="";
     if(!r.ok){ const j=await r.json(); setG(j.error||"Échec.","bad"); $("gBtn").disabled=false; return; }
     await follow();
-  }catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); $("gBtn").disabled=false; }
+  }catch(err){ setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); $("gBtn").disabled=false; }
 };
 $("winBtn").onclick=async()=>{
   $("winBtn").disabled=true; setG("Ouverture de Chrome…");
-  try{ await fetch(`/api/login/start?p=${PROVIDER}&mode=window`,{method:"POST"}); await follow(); }
+  try{ await fetch("/api/login/window",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:PROVIDER})}); await follow(); }
   catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); $("winBtn").disabled=false; }
 };
-$("tokSave").onclick=async()=>{
-  const v=$("tok").value.trim().replace(/^Bearer\s+/i,"");
-  if(v.split(".").length!==3){ $("tokErr").textContent="Ce n’est pas une clé valide : elle commence par « eyJ » et contient deux points."; return; }
-  try{
-    const r=await fetch("/api/token",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:v})});
-    const j=await r.json(); if(!r.ok) throw new Error(j.error||"Enregistrement impossible.");
-    afterLogin();
-  }catch(e){ $("tokErr").textContent=e.message; }
-};
-
 /* Onglets et réglages */
 function showTab(name){
   $("scr-onboarding").hidden = name!=="onboarding";
@@ -1615,6 +1688,11 @@ document.querySelectorAll("#views button").forEach(b=>b.onclick=()=>{S.view=b.da
 document.querySelectorAll("#durs button").forEach(b=>b.onclick=()=>{S.dur=+b.dataset.d; press($("durs"),x=>x===b); load();});
 $("nowBtn").onclick=setNow;
 $("onbGo").onclick=()=>{ showTab("slots"); load(); };
+$("forgetBtn").onclick=async()=>{
+  if(!confirm("Supprimer tes comptes et identifiants enregistrés ici ? Tu devras reconnecter tes clubs.")) return;
+  try{ await fetch("/api/forget",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }catch(e){}
+  S.accounts=null; S.data=null; gate();
+};
 
 /* Démarrage */
 applyPrefs();
@@ -1624,7 +1702,9 @@ if(!LIVE){
   $("durRow").hidden=true; $("views").hidden=true; $("hoursLbl").textContent="À";
   $("foot").textContent="Horaires d’ouverture indicatifs, relevés en octobre 2026. Les créneaux libres s’affichent dans l’outil installé sur ton PC.";
 } else {
-  $("foot").textContent="Prix par joueur. Smash : toucher un horaire ouvre directement la réservation de la piste. Let Padel et 4PADEL : le planning du club s’ouvre, choisis-y l’horaire.";
+  $("foot").textContent = window.PADEL_CLOUD
+    ? "Prix par joueur. Toucher un horaire ouvre le site du club : choisis-y le même horaire pour réserver."
+    : "Prix par joueur. Smash : toucher un horaire ouvre directement la réservation de la piste. Let Padel et 4PADEL : le planning du club s’ouvre, choisis-y l’horaire.";
 }
 const n0=new Date(); S.t=Math.min(22,Math.max(8,n0.getHours())); syncHours();
 if(LIVE) gate(); else load();
