@@ -1287,6 +1287,15 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .status.wait::before{content:"";display:inline-block;width:13px;height:13px;margin-right:7px;vertical-align:-1px;
   border:2px solid var(--hair);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+.sheet{position:relative}
+.overlay{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+  padding:24px;text-align:center;background:color-mix(in srgb,var(--card) 92%,transparent);
+  backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);border-radius:inherit;animation:fade .2s ease}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.spinner-big{width:46px;height:46px;border:4px solid var(--hair);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+.overlay-msg{font-size:1.05rem;font-weight:600;margin:6px 0 0;min-height:1.4em}
+.overlay-sub{font-size:.85rem;color:var(--muted);margin:0}
+#overlayCancel{margin-top:10px}
 .skel{height:64px;border-radius:14px;background:linear-gradient(90deg,var(--card) 0%,var(--fill) 50%,var(--card) 100%);background-size:200% 100%;animation:sk 1.2s linear infinite;margin-top:12px}
 @keyframes sk{to{background-position:-200% 0}}
 .refresh{border:0;background:none;color:var(--accent);font-size:.85rem;font-weight:600;cursor:pointer;padding:0;margin-left:6px}
@@ -1409,6 +1418,12 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 
 <dialog id="sheet">
   <form class="sheet" id="credForm" autocomplete="on">
+    <div class="overlay" id="overlay" hidden aria-live="polite">
+      <div class="spinner-big" aria-hidden="true"></div>
+      <p class="overlay-msg" id="overlayMsg">Connexion en cours…</p>
+      <p class="overlay-sub">Garde cette fenêtre ouverte.</p>
+      <button class="btn-ghost" id="overlayCancel" type="button">Annuler</button>
+    </div>
     <h2 id="sheetTitle">Se connecter</h2>
     <p class="sub" id="sheetText"></p>
     <label class="field"><span>E-mail</span><input type="email" id="cEmail" autocomplete="username" required></label>
@@ -1690,12 +1705,16 @@ const ready = a => !!a && (a.connected || a.saved);   // identifiants enregistr�
 let PROVIDER="4padel";
 function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:(msg?" wait":"")); }
 function busy(btn, on){ if(!btn) return; btn.disabled=on; btn.classList.toggle("loading", on); }
+let LOGIN_ABORT=false;
+function showOverlay(msg){ LOGIN_ABORT=false; $("overlayMsg").textContent=msg||"Connexion en cours…"; $("overlay").hidden=false; }
+function overlay(msg){ if(!$("overlay").hidden && msg) $("overlayMsg").textContent=msg; }
+function hideOverlay(){ $("overlay").hidden=true; }
 let STEP_TIMER=null;
 function startSteps(club){
   const steps=[`Connexion à ${club}…`, `Ouverture du site ${club}…`, "Vérification de tes identifiants…", "Encore quelques secondes…"];
-  let i=0; setG(steps[0]);
+  let i=0; showOverlay(steps[0]);
   clearInterval(STEP_TIMER);
-  STEP_TIMER=setInterval(()=>{ i=Math.min(i+1,steps.length-1); if($("gMsg").className.includes("wait")) setG(steps[i]); }, 2500);
+  STEP_TIMER=setInterval(()=>{ i=Math.min(i+1,steps.length-1); overlay(steps[i]); }, 2500);
 }
 function stopSteps(){ clearInterval(STEP_TIMER); STEP_TIMER=null; }
 async function openSheet(p){
@@ -1709,7 +1728,7 @@ async function openSheet(p){
   $("winBtn").parentElement.hidden=!!window.PADEL_CLOUD;
   const saved=((S.accounts||{})[PROVIDER]||{});
   $("cRemember").checked = saved.email ? !!saved.saved : true;
-  $("cPass").value=""; setG(""); $("gBtn").disabled=false; $("winBtn").disabled=false;
+  $("cPass").value=""; setG(""); hideOverlay(); $("gBtn").disabled=false; $("winBtn").disabled=false;
   $("cEmail").value=((S.accounts||{})[PROVIDER]||{}).email||"";
   $("sheet").showModal();
   if(!S.accounts){ try{ S.accounts=await (await fetch("/api/accounts")).json(); $("cEmail").value=(S.accounts[PROVIDER]||{}).email||""; }catch(e){} }
@@ -1723,31 +1742,33 @@ async function afterLogin(){
 async function follow(){
   const deadline=Date.now()+360000;   // au-delà de 6 min, on cesse d'attendre
   let fails=0;
-  function stop(){ busy($("gBtn"), false); busy($("winBtn"), false); }
+  function stop(){ stopSteps(); hideOverlay(); }
   while(Date.now()<deadline){
     await new Promise(r=>setTimeout(r,1000));
     let st;
     try{ st=await (await fetch("/api/login/status")).json(); fails=0; }
-    catch(e){ if(++fails>=8){ stopSteps(); setG("Connexion perdue avec le serveur. Réessaie.","bad"); stop(); return; } continue; }
-    if(st.state==="done"){ stopSteps(); setG(st.message,"ok"); busy($("gBtn"), false); busy($("winBtn"), false); setTimeout(afterLogin,900); return; }
-    if(st.state==="error"){ stopSteps(); setG(st.message,"bad"); stop(); return; }
-    if(st.message) setG(st.message);
+    catch(e){ if(++fails>=8){ stop(); setG("Connexion perdue avec le serveur. Réessaie.","bad"); return; } continue; }
+    if(LOGIN_ABORT) return;
+    if(st.state==="done"){ overlay(st.message); setTimeout(()=>{ stopSteps(); hideOverlay(); afterLogin(); }, 700); return; }
+    if(st.state==="error"){ stop(); setG(st.message,"bad"); return; }
+    if(st.message) overlay(st.message);
   }
-  stopSteps(); setG("La connexion prend trop de temps. Réessaie.","bad"); stop();
+  stop(); setG("La connexion prend trop de temps. Réessaie.","bad");
 }
 $("sheetClose").onclick=()=>$("sheet").close();
+$("overlayCancel").onclick=()=>{ LOGIN_ABORT=true; stopSteps(); hideOverlay(); setG("Connexion annulée.","bad"); };
 $("credForm").onsubmit=async e=>{
-  e.preventDefault(); busy($("gBtn"), true); startSteps((SHEETS[PROVIDER]||{}).club||"ton club");
+  e.preventDefault(); startSteps((SHEETS[PROVIDER]||{}).club||"ton club");
   try{
     const r=await fetch("/api/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({provider:PROVIDER,email:$("cEmail").value,password:$("cPass").value,remember:$("cRemember").checked})});
     $("cPass").value="";
-    if(!r.ok){ const j=await r.json(); stopSteps(); setG(j.error||"Échec.","bad"); busy($("gBtn"), false); return; }
+    if(!r.ok){ const j=await r.json(); stopSteps(); hideOverlay(); setG(j.error||"Échec.","bad"); return; }
     await follow();
-  }catch(err){ stopSteps(); setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); busy($("gBtn"), false); }
+  }catch(err){ stopSteps(); hideOverlay(); setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); }
 };
 $("winBtn").onclick=async()=>{
-  busy($("winBtn"), true); startSteps((SHEETS[PROVIDER]||{}).club||"ton club");
+  startSteps((SHEETS[PROVIDER]||{}).club||"ton club");
   try{ await fetch("/api/login/window",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:PROVIDER})}); await follow(); }
   catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); busy($("winBtn"), false); }
 };
