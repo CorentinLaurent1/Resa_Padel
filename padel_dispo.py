@@ -37,6 +37,9 @@ LETPADEL_CLUBS = {
     "letpadel-fleury": "fc96f79e-ef94-4fa6-9b01-d494eccaa54f",
 }
 LETPADEL_HOME = "https://letpadel.doinsport.club/home"
+LETPADEL_LOGIN_URL = "https://api-v3.doinsport.club/client_login_check"
+LETPADEL_LOGIN_CLUB = "/clubs/6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f"
+LETPADEL_WHITE_LABEL = "/clubs/white-labels/9547ffa3-fb4e-4f84-944f-b73d64c05934"
 SMASH_BASE = "https://smashpadel.mymobileapp.fr"
 SMASH_SPORT_PADEL = "2"
 FOURPADEL_CENTER_ID = 9
@@ -636,6 +639,23 @@ def _done_message(provider, value):
     return f"Connecté à {name}" + (f" jusqu’au {exp:%d/%m}." if exp else ".")
 
 
+def letpadel_login(email, password):
+    """Connexion Let Padel par appel direct à l'API Doinsport : pas de navigateur."""
+    body = {"username": email, "password": password, "club": LETPADEL_LOGIN_CLUB,
+            "clubWhiteLabel": LETPADEL_WHITE_LABEL, "origin": "white_label_app"}
+    try:
+        j = http_json(LETPADEL_LOGIN_URL, "POST", body,
+                      {**DOIN_HEADERS, "Content-Type": "application/json"})
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401, 403):
+            raise RuntimeError("Connexion refusée : vérifie l’e-mail et le mot de passe.")
+        raise RuntimeError(f"Let Padel a répondu {e.code}.")
+    token = j.get("token")
+    if not token:
+        raise RuntimeError("Réponse inattendue de Let Padel.")
+    return token
+
+
 def launch_browser(pw, chrome):
     """Lance un navigateur headless : d'abord le Chrome du système, sinon le Chromium de Playwright."""
     last = None
@@ -663,7 +683,10 @@ def chromium_hint():
 
 
 def auto_login(provider, email, password, report=lambda m: None):
-    """Connexion invisible avec e-mail et mot de passe. Renvoie la session du club."""
+    """Connexion avec e-mail et mot de passe. Renvoie la session du club."""
+    if provider == "letpadel":
+        report("Connexion à Let Padel…")
+        return letpadel_login(email, password)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
