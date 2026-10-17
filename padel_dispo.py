@@ -2,19 +2,28 @@
 """
 Padel Orléans : créneaux libres en direct, servis en local.
 
-Lancement :  python3 padel_dispo.py
+Sur ton PC :  py padel_dispo.py   (ou double-clic sur lancer_padel.bat)
 Puis la page s'ouvre sur http://127.0.0.1:8765
 
-Python 3.8+ et le module playwright (py -m pip install playwright).[cite: 1]
-Rien d'autre à télécharger : le script utilise ton Chrome ou Edge.[cite: 1]
-Tes identifiants sont dans identifiants.dat, chiffré par Windows (DPAPI).[cite: 1]
-La clé de session 4PADEL reste dans le fichier .4padel_token à côté du script.[cite: 1]
+Sur un hébergeur (Render…) : la variable PORT est lue automatiquement.
+Définis aussi PADEL_ACCESS (mot de passe d'accès à la page), sinon
+n'importe qui ayant l'adresse peut l'ouvrir. Identifiants des clubs
+possibles par variables : PADEL_4PADEL_EMAIL / PADEL_4PADEL_PASSWORD,
+PADEL_SMASH_EMAIL / PADEL_SMASH_PASSWORD.
+
+Python 3.8+ et le module playwright (py -m pip install playwright).
+Rien d'autre à télécharger : le script utilise ton Chrome ou Edge.
+Tes identifiants sont dans identifiants.dat, chiffré par Windows (DPAPI).
+La clé de session 4PADEL reste dans le fichier .4padel_token à côté du script.
 """
 import base64, datetime, json, os, re, shutil, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", 8765))
+CLOUD = "PORT" in os.environ                      # lancé par un hébergeur (Render…)
+HOST = os.environ.get("HOST", "0.0.0.0" if CLOUD else "127.0.0.1")
+ACCESS = os.environ.get("PADEL_ACCESS", "")       # mot de passe d'accès à la page
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.path.join(HERE, ".4padel_token")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -22,6 +31,7 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 
 # --- Configuration des clubs (relevée dans tes captures HAR) -----------------
 DOINSPORT_PADEL_ACTIVITY = "ce8c306e-224a-4f24-aa9d-6500580924dc"   # « Padel », vu à Fleury
+LETPADEL_CATEGORY = {"letpadel-fleury": "be10916d-f273-4f52-ad9b-da6379dca5c9"}   # vu dans ta 1re capture
 LETPADEL_CLUBS = {
     "letpadel-pryve": "6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f",
     "letpadel-fleury": "fc96f79e-ef94-4fa6-9b01-d494eccaa54f",
@@ -80,6 +90,14 @@ def padel_activity(club_id):
     return _ACTIVITY_CACHE[club_id]
 
 
+def letpadel_url(key, club_id):
+    url = (f"https://letpadel.doinsport.club/select-booking?guid=%22{club_id}%22&from=sport"
+           f"&activitySelectedId=%22{padel_activity(club_id)}%22")
+    if key in LETPADEL_CATEGORY:
+        url += f"&categoryId=%22{LETPADEL_CATEGORY[key]}%22"
+    return url
+
+
 def letpadel_slots(club_id, date, duration):
     activity = padel_activity(club_id)
     q = urllib.parse.urlencode({
@@ -128,7 +146,7 @@ def jwt_payload(token):
 
 
 def is_4padel_token(token):
-    """Une clé 4PADEL contient « upn » et « roleId » (vu dans ta capture).[cite: 1]"""
+    """Une clé 4PADEL contient « upn » et « roleId » (vu dans ta capture)."""
     try:
         p = jwt_payload(token)
         return "upn" in p and "roleId" in p
@@ -172,6 +190,7 @@ def fourpadel_slots(date, duration):
     headers = {"Authorization": auth, "Origin": "https://www.4padel.fr",
                "Referer": "https://www.4padel.fr/"}
     found = []
+    # Le site interroge par fenêtres de quelques heures : on fait pareil.
     for start in range(8, 23, 2):
         end = min(start + 2, 23)
         body = {"startingDateZuluTime": zulu(d, start), "endingDateZuluTime": zulu(d, end),
@@ -196,7 +215,7 @@ def parse_fourpadel(items, duration):
         fields = [f for f in s.get("fields", []) if f.get("canBookOnline", True)]
         if not fields:
             continue
-        t = s["startingDate"][11:16]   # heure locale du club
+        t = s["startingDate"][11:16]   # heure locale du club, telle qu'affichée sur le site
         price = fields[0].get("participationWebPrice")
         prev = seen.get(t)
         if not prev or len(fields) > prev["courts"]:
@@ -204,8 +223,9 @@ def parse_fourpadel(items, duration):
     return [seen[k] for k in sorted(seen)]
 
 
+
 # --- Smash Padel (Live Xperience) : page HTML, nécessite d'être connecté -------
-SLOT_RE = re.compile(r"""date-countDispo="(\d+)"\s+onclick="choosePop\('\d\d/\d\d/\d{4} (\d\d:\d\d):\d\d','[^']*','([^']*)'""")
+SLOT_RE = re.compile(r"""date-countDispo="(\d+)"\s+onclick="choosePop\('(\d\d/\d\d/\d{4} (\d\d:\d\d):\d\d)','([^']*)','([^']*)'""")
 TOKEN_RE = re.compile(r"livexperience_site_token=([\w-]+)")
 
 
@@ -250,16 +270,20 @@ def parse_smash(html):
     if "btn-horaires" not in html:
         if "logout.asp" not in html and ("login" in html.lower() or "connexion" in html.lower()):
             raise NeedsToken("Ta session Smash Padel a expiré. Reconnecte-toi.")
-        return []
+        return []   # jour fermé ou aucune réservation possible
     out = []
-    for count, t, prices in SLOT_RE.findall(html):
+    for count, stamp, t, courts, prices in SLOT_RE.findall(html):
         vals = [float(p.replace(",", ".")) for p in prices.split(";")[1:] if p and p != "999"]
+        ids = [c for c in courts.split(";")[1:] if c.isdigit()]
         out.append({"time": t, "courts": int(count),
-                    "price": euros(min(vals) / 4) if vals else None})
+                    "price": euros(min(vals) / 4) if vals else None,   # prix affiché par terrain, 4 joueurs
+                    "book": {"date": stamp, "courts": ids}})
     return sorted(out, key=lambda x: x["time"])
 
 
 # --- Identifiants protégés ---------------------------------------------------
+# Sous Windows, le fichier est chiffré avec DPAPI : seul ton compte Windows, sur
+# ce PC, peut le déchiffrer. Ailleurs, il n'est lisible que par ton utilisateur.
 CREDS_FILE = os.path.join(HERE, "identifiants.dat")
 
 
@@ -283,16 +307,22 @@ def _dpapi(data, protect):
 
 
 def load_creds():
+    creds = {}
     try:
         with open(CREDS_FILE, "rb") as f:
             raw = f.read()
+        kind, _, payload = raw.partition(b"\n")
+        data = base64.b64decode(payload)
+        if kind == b"DPAPI1":
+            data = _dpapi(data, False)
+        creds = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
-        return {}
-    kind, _, payload = raw.partition(b"\n")
-    data = base64.b64decode(payload)
-    if kind == b"DPAPI1":
-        data = _dpapi(data, False)
-    return json.loads(data.decode("utf-8"))
+        pass
+    for key, env in (("4padel", "4PADEL"), ("smash", "SMASH")):   # variables d'environnement prioritaires
+        e, p = os.environ.get(f"PADEL_{env}_EMAIL"), os.environ.get(f"PADEL_{env}_PASSWORD")
+        if e and p:
+            creds[key] = {"email": e, "password": p}
+    return creds
 
 
 def save_creds(creds):
@@ -312,6 +342,10 @@ def save_creds(creds):
 
 
 # --- Connexion aux clubs -----------------------------------------------------
+# Deux façons :
+#  - automatique : un Chrome invisible remplit le vrai formulaire avec ton e-mail
+#    et ton mot de passe, puis récupère la session (et recommence seul à expiration) ;
+#  - manuelle : une fenêtre Chrome s'ouvre et tu te connectes toi-même (Google…).
 SIGNIN_URL = "https://www.4padel.fr/signin?redirect=%2Freservations%2Fslots"
 API_HOST_MATCH = "lefive.fr"
 SMASH_HOST_MATCH = "smashpadel.mymobileapp.fr"
@@ -330,6 +364,8 @@ PROVIDERS = {
               "hint": "Dans la fenêtre Chrome, connecte-toi à Smash Padel puis ouvre « Nouvelle réservation »."},
 }
 
+# Repère le champ mot de passe visible et le champ e-mail juste avant lui (en
+# ignorant par exemple le champ « newsletter » du pied de page).
 FIND_FORM_JS = r"""() => {
   const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
@@ -450,10 +486,11 @@ def _persist(ctx, provider, found):
 
 
 def auto_login(provider, email, password, report=lambda m: None):
+    """Connexion invisible avec e-mail et mot de passe. Renvoie un message, ou lève une erreur."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        raise RuntimeError("Il manque un module : lance « py -m pip install playwright » puis relance.")[cite: 1]
+        raise RuntimeError("Il manque un module : lance « py -m pip install playwright » puis relance.")
     chrome = find_chrome()
     with BROWSER_LOCK, sync_playwright() as pw:
         try:
@@ -469,11 +506,12 @@ def auto_login(provider, email, password, report=lambda m: None):
             pg.goto(PROVIDERS[provider]["url"], wait_until="domcontentloaded", timeout=45000)
             pg.wait_for_timeout(1500)
             if _scan(ctx, provider, found) and provider == "smash":
-                return _persist(ctx, provider, found)
+                return _persist(ctx, provider, found)      # déjà connecté
             try:
                 pg.evaluate(COOKIE_JS)
             except Exception:
                 pass
+            # Trouver le formulaire, en cliquant au besoin sur « Se connecter / E-mail ».
             ok = False
             for _ in range(4):
                 try:
@@ -501,6 +539,7 @@ def auto_login(provider, email, password, report=lambda m: None):
                 if _scan(ctx, provider, found):
                     return _persist(ctx, provider, found)
                 if provider == "smash" and found.get("logged") and "token" not in found:
+                    # Connecté mais jeton pas encore visible : on ouvre la réservation.
                     try:
                         pg.evaluate(r"""() => { const a = [...document.querySelectorAll('a,button')].find(e => /r[ée]serv/i.test(e.textContent||'')); if (a) a.click(); }""")
                     except Exception:
@@ -511,11 +550,12 @@ def auto_login(provider, email, password, report=lambda m: None):
 
 
 def interactive_login(provider):
+    """Fenêtre Chrome visible : tu te connectes toi-même (Google, Apple…)."""
     cfg = PROVIDERS[provider]
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return set_login("error", "Il manque un module : lance « py -m pip install playwright » puis relance.")[cite: 1]
+        return set_login("error", "Il manque un module : lance « py -m pip install playwright » puis relance.")
     chrome = find_chrome()
     if not chrome:
         return set_login("error", "Chrome, Edge ou Brave introuvable sur cet ordinateur.")
@@ -581,6 +621,7 @@ def start_login(provider, mode):
 
 
 def relogin_if_possible(provider):
+    """Appelé quand une session a expiré : reconnexion silencieuse si on a les identifiants."""
     try:
         c = load_creds().get(provider)
     except Exception:
@@ -592,6 +633,92 @@ def relogin_if_possible(provider):
         return True
     except Exception:
         return False
+
+
+# --- Ouvrir la réservation d'un créneau --------------------------------------
+# Smash : on ouvre Chrome (profil dédié, déjà connecté) et on fait exactement ce
+# que fait le site quand tu cliques sur un terrain : choose(...) charge
+# /resa-confirm.asp pour ce terrain, cette date et cette durée.
+SMASH_PICK_JS = r"""([ids, stamp]) => {
+  for (const id of ids) {
+    const b = document.getElementById('terrain_' + id);
+    if (b) { choose(id, b.getAttribute('data-nom'), stamp, '', b.getAttribute('data-type')); return b.getAttribute('data-nom'); }
+  }
+  return null;
+}"""
+
+
+def visible_browser(pw, url):
+    """Se connecte au Chrome dédié s'il tourne déjà, sinon le lance."""
+    try:
+        return pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}"), False
+    except Exception:
+        pass
+    chrome = find_chrome()
+    if not chrome:
+        raise RuntimeError("Chrome, Edge ou Brave introuvable sur cet ordinateur.")
+    subprocess.Popen([chrome, f"--remote-debugging-port={CDP_PORT}", f"--user-data-dir={PROFILE_DIR}",
+                      "--no-first-run", "--no-default-browser-check", url],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        try:
+            return pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}"), True
+        except Exception:
+            time.sleep(0.5)
+    raise RuntimeError("Impossible d’ouvrir Chrome.")
+
+
+def fill_login(pg, email, password):
+    for _ in range(4):
+        if pg.evaluate(FIND_FORM_JS):
+            pg.fill('[data-padel="email"]', email)
+            pg.fill('[data-padel="pw"]', password)
+            pg.press('[data-padel="pw"]', "Enter")
+            return True
+        pg.evaluate(REVEAL_JS)
+        pg.wait_for_timeout(1200)
+    return False
+
+
+def open_smash_booking(stamp, ids, duration):
+    from playwright.sync_api import sync_playwright
+    day = stamp.split(" ")[0]
+    with BROWSER_LOCK, sync_playwright() as pw:
+        browser, fresh = visible_browser(pw, SMASH_BASE + "/")
+        ctx = browser.contexts[0]
+        sess = read_smash() or {}
+        cookies = []
+        for part in (sess.get("cookies") or "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                cookies.append({"name": k, "value": v, "url": SMASH_BASE + "/"})
+        if cookies:
+            ctx.add_cookies(cookies)
+        pg = next((p for p in ctx.pages if SMASH_HOST_MATCH in p.url), None) if fresh else None
+        pg = pg or ctx.new_page()
+        pg.goto(SMASH_BASE + "/", wait_until="domcontentloaded", timeout=45000)
+        pg.wait_for_timeout(1200)
+        if "logout.asp" not in pg.content():
+            c = (load_creds() or {}).get("smash")
+            if not c or not fill_login(pg, c["email"], c["password"]):
+                pg.bring_to_front()
+                return "Connecte-toi dans la fenêtre Chrome, puis reclique sur l’horaire."
+            pg.wait_for_timeout(3000)
+            if "logout.asp" not in pg.content():
+                pg.bring_to_front()
+                return "Connexion à Smash refusée : vérifie ton e-mail et ton mot de passe."
+        pg.evaluate("([d, du]) => myLoad('/reservation_capsule.asp?date=' + d + '&duree=' + du + '&id_sport=2')",
+                    [day, str(duration)])
+        pg.wait_for_selector("#terrain_" + ids[0], state="attached", timeout=20000)
+        name = pg.evaluate(SMASH_PICK_JS, [ids, stamp])
+        pg.bring_to_front()
+        if not name:
+            return "Ce créneau vient d’être pris. Choisis-en un autre."
+        try:   # le site charge la confirmation une demi-seconde après le choix du terrain
+            pg.wait_for_function("() => !document.getElementById('terrain_" + ids[0] + "')", timeout=10000)
+        except Exception:
+            return "La page de confirmation tarde à s’afficher : regarde la fenêtre Chrome."
+        return f"Réservation ouverte : {name.strip()} à {stamp[11:16].replace(':', 'h')}."
 
 
 # --- Agrégation --------------------------------------------------------------
@@ -619,6 +746,12 @@ def all_slots(date, duration):
     with ThreadPoolExecutor(max_workers=5) as ex:
         futs = {k: ex.submit(run, *v, provider=k if k in PROVIDERS else None) for k, v in jobs.items()}
         clubs = {k: f.result() for k, f in futs.items()}
+    for key, cid in LETPADEL_CLUBS.items():
+        if cid and key in clubs:
+            clubs[key]["book_url"] = letpadel_url(key, cid)
+    if CLOUD:   # sur un serveur, impossible d'ouvrir Chrome chez toi : lien vers le site du club
+        for slot in clubs.get("smash", {}).get("slots", []) or []:
+            slot.pop("book", None)
     return {"date": date, "duration": duration, "clubs": clubs}
 
 
@@ -635,11 +768,38 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def allowed(self):
+        """Mot de passe d'accès (PADEL_ACCESS) demandé par le navigateur quand il est défini."""
+        if not ACCESS:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                if base64.b64decode(auth[6:]).decode("utf-8").split(":", 1)[-1] == ACCESS:
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Padel Orleans", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def same_origin(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "")
+        return urllib.parse.urlparse(origin).netloc in (host, f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+
     def do_GET(self):
+        if not self.allowed():
+            return
         u = urllib.parse.urlparse(self.path)
         if u.path == "/":
-            # Forçage fiable du mode LIVE pour l'affichage des clubs et des créneaux
-            html = PAGE.replace("const LIVE = window.PADEL_LIVE === true;", "const LIVE = true;")
+            # Forçage fiable du mode LIVE (créneaux en direct) sur la page servie par le script
+            html = PAGE.replace("const LIVE = window.PADEL_LIVE === true;",
+                                "const LIVE = true;" + (" window.PADEL_CLOUD = true;" if CLOUD else ""), 1)
             return self.send(200, html.encode(), "text/html; charset=utf-8")
         if u.path == "/api/slots":
             q = urllib.parse.parse_qs(u.query)
@@ -657,19 +817,45 @@ class Handler(BaseHTTPRequestHandler):
                 c = load_creds()
             except Exception:
                 c = {}
-            return self.send(200, {k: {"email": v.get("email", "")} for k, v in c.items()})
+            out = {k: {"email": v.get("email", "")} for k, v in c.items()}
+            tok = read_token()
+            exp = token_expiry(tok) if tok else None
+            ok4 = bool(tok) and (exp is None or exp > datetime.datetime.now())
+            out.setdefault("4padel", {}).update(connected=ok4, until=f"{exp:%d/%m}" if ok4 and exp else None)
+            sm = read_smash()
+            out.setdefault("smash", {}).update(connected=bool(sm and sm.get("token")), until=None)
+            return self.send(200, out)
         self.send(404, {"error": "Introuvable."})
 
     def do_POST(self):
-        if self.headers.get("Origin", f"http://127.0.0.1:{PORT}") not in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"):
+        if not self.allowed():
+            return
+        if not self.same_origin():
             return self.send(403, {"error": "Origine refusée."})
         if self.path.startswith("/api/login/start"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             provider = q.get("p", ["4padel"])[0]
             if provider not in PROVIDERS:
                 return self.send(400, {"error": "Club inconnu."})
-            start_login(provider, q.get("mode", ["window"])[0])
+            mode = q.get("mode", ["window"])[0]
+            if CLOUD and mode == "window":
+                return self.send(400, {"error": "Sur le serveur, utilise l’e-mail et le mot de passe."})
+            start_login(provider, mode)
             return self.send(200, LOGIN)
+        if self.path == "/api/open":
+            if CLOUD:
+                return self.send(400, {"error": "Ouverture directe possible seulement sur ton PC."})
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                j = json.loads(self.rfile.read(n))
+                stamp, ids, duration = j["date"], [str(int(x)) for x in j["courts"]], int(j["duration"])
+                assert re.fullmatch(r"\d\d/\d\d/\d{4} \d\d:\d\d:\d\d", stamp) and ids and duration in (60, 90, 120)
+            except Exception:
+                return self.send(400, {"error": "Créneau invalide."})
+            try:
+                return self.send(200, {"message": open_smash_booking(stamp, ids, duration)})
+            except Exception as e:
+                return self.send(500, {"error": f"Ouverture impossible ({str(e) or type(e).__name__})."})
         if self.path == "/api/credentials":
             try:
                 n = int(self.headers.get("Content-Length", "0"))
@@ -696,18 +882,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self.send(400, {"error": "Clé invalide."})
         if not is_4padel_token(token):
-            return self.send(400, {"error": "Cette clé ne vient pas de 4PADEL."})
+            return self.send(400, {"error": "Cette clé ne vient pas de 4PADEL (c’est peut-être celle de Google)."})
         save_token(token)
         exp = token_expiry(token)
         self.send(200, {"ok": True, "expires": exp.isoformat() if exp else None})
 
 
 def main():
-    url = f"http://127.0.0.1:{PORT}"
-    # Écouter sur 0.0.0.0 est obligatoire pour que Render détecte le port ouvert
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Padel Orléans tourne sur le port {PORT}  (Ctrl+C pour arrêter)")
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if HOST != "127.0.0.1" and not ACCESS:
+        print("Attention : page accessible depuis l'extérieur sans mot de passe. Définis PADEL_ACCESS.")
+    if not CLOUD:
+        url = f"http://127.0.0.1:{PORT}"
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -719,136 +907,205 @@ PAGE = r'''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#F2F2F7">
 <title>Padel à Orléans</title>
 <style>
 :root{
-  --bg:#F2F2F7; --card:#FFFFFF; --ink:#000000; --muted:#8E8E93; --hair:#C6C6C8;
-  --fill:#E5E5EA; --seg:#FFFFFF; --accent:#007AFF; --accent-ink:#FFFFFF;
-  --green:#34C759; --green-bg:#E8F8ED; --grey-bg:#F1F1F3; --shadow:0 4px 20px rgba(0,0,0,0.06);
+  --bg:#F2F2F7; --card:#FFFFFF; --ink:#000000; --muted:#6C6C70; --hair:#E5E5EA; --fill:#E9E9EE; --seg:#FFFFFF;
+  --blue:#007AFF; --green:#34C759; --orange:#FF9500; --red:#FF3B30;
+  --accent:var(--blue); --on-accent:#FFFFFF; --tabbar:rgba(249,249,251,.86);
   color-scheme:light; box-sizing:border-box;
   padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
 }
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
-  --bg:#000000; --card:#1C1C1E; --ink:#F2F2F7; --muted:#98989D; --hair:#38383A;
-  --fill:#2C2C2E; --seg:#636366; --accent:#0A84FF; --accent-ink:#FFFFFF;
-  --green:#30D158; --green-bg:#0F2E18; --grey-bg:#2C2C2E; --shadow:0 4px 20px rgba(0,0,0,0.3); color-scheme:dark;}}
+  --bg:#000000; --card:#1C1C1E; --ink:#FFFFFF; --muted:#98989F; --hair:#38383A; --fill:#2C2C2E; --seg:#636366;
+  --blue:#0A84FF; --green:#30D158; --orange:#FF9F0A; --red:#FF453A; --tabbar:rgba(22,22,24,.86); color-scheme:dark;}}
 :root[data-theme="dark"]{
-  --bg:#000000; --card:#1C1C1E; --ink:#F2F2F7; --muted:#98989D; --hair:#38383A;
-  --fill:#2C2C2E; --seg:#636366; --accent:#0A84FF; --accent-ink:#FFFFFF;
-  --green:#30D158; --green-bg:#0F2E18; --grey-bg:#2C2C2E; --shadow:0 4px 20px rgba(0,0,0,0.3); color-scheme:dark;}
-
+  --bg:#000000; --card:#1C1C1E; --ink:#FFFFFF; --muted:#98989F; --hair:#38383A; --fill:#2C2C2E; --seg:#636366;
+  --blue:#0A84FF; --green:#30D158; --orange:#FF9F0A; --red:#FF453A; --tabbar:rgba(22,22,24,.86); color-scheme:dark;}
+:root[data-accent="green"]{--accent:var(--green)}
+:root[data-accent="orange"]{--accent:var(--orange)}
 *,*::before,*::after{box-sizing:inherit}
-html{scroll-padding-top:env(safe-area-inset-top,0px)}
-body{margin:0;background:var(--bg);color:var(--ink);
+html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);min-height:100%;
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","Segoe UI",Roboto,Arial,sans-serif;
-  font-size:16px;line-height:1.5;letter-spacing:-.01em;-webkit-font-smoothing:antialiased}
-
-.wrap{max-width:720px;margin:0 auto;padding:32px 20px 64px}
-header{margin-bottom:28px}
+  font-size:17px;line-height:1.35;letter-spacing:-.015em;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;letter-spacing:inherit}
+.screen{max-width:520px;margin:0 auto;padding:18px 16px calc(96px + env(safe-area-inset-bottom,0px))}
+.kicker{margin:10px 4px 2px;font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.02em}
+.titlerow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 4px 16px}
 h1{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue","Segoe UI",sans-serif;
-  font-size:clamp(2rem,6vw,2.8rem);font-weight:700;letter-spacing:-.03em;line-height:1.1;margin:0}
-.lede{color:var(--muted);font-size:1.05rem;margin:8px 0 0}
+  font-size:2.15rem;font-weight:700;letter-spacing:-.035em;line-height:1.1;margin:0}
+.pill{border:0;background:var(--card);color:var(--accent);font-weight:600;font-size:.95rem;padding:8px 16px;border-radius:999px;cursor:pointer}
 
-.controls{background:var(--card);border-radius:20px;padding:20px;box-shadow:var(--shadow);margin-bottom:24px;display:grid;gap:18px}
-.label{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 8px 2px}
+/* Days */
+.days{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;margin:0 -16px 14px;padding:2px 16px}
+.days::-webkit-scrollbar{display:none}
+.day{flex:0 0 auto;width:62px;border:0;background:var(--card);border-radius:16px;padding:9px 0 8px;cursor:pointer;text-align:center}
+.day small{display:block;font-size:.76rem;color:var(--muted);font-weight:500}
+.day b{display:block;font-size:1.35rem;font-weight:700;letter-spacing:-.02em;margin-top:2px}
+.day[aria-pressed="true"]{background:var(--accent);color:var(--on-accent)}
+.day[aria-pressed="true"] small{color:rgba(255,255,255,.85)}
 
-.seg{display:flex;background:var(--fill);border-radius:12px;padding:3px;gap:3px;overflow-x:auto;scrollbar-width:none}
-.seg::-webkit-scrollbar{display:none}
-.seg button{flex:1 0 auto;min-width:60px;border:0;background:transparent;color:var(--ink);font:inherit;font-size:.85rem;
-  font-weight:500;padding:8px 10px;border-radius:9px;cursor:pointer;line-height:1.2;transition:all .2s ease}
-.seg button small{display:block;font-size:.7rem;color:var(--muted);font-weight:400;margin-top:2px}
-.seg button[aria-pressed="true"]{background:var(--seg);color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.1),0 0 1px rgba(0,0,0,.15);font-weight:600}
+/* Grouped block */
+.group{background:var(--card);border-radius:16px;padding:4px 14px;margin-bottom:18px}
+.grow{display:flex;align-items:center;gap:12px;padding:10px 0;min-width:0}
+.grow + .grow{border-top:.5px solid var(--hair)}
+.glabel{flex:0 0 58px;font-weight:600;font-size:.95rem}
+.seg{flex:1;display:flex;background:var(--fill);border-radius:10px;padding:2px;gap:2px;min-width:0}
+.seg button{flex:1;border:0;background:transparent;font-size:.92rem;font-weight:500;padding:7px 8px;border-radius:8px;cursor:pointer;white-space:nowrap}
+.seg button[aria-pressed="true"]{background:var(--seg);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04)}
+.hours{flex:1;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;min-width:0;padding:2px 0}
+.hours::-webkit-scrollbar{display:none}
+.hours button{flex:0 0 auto;border:0;background:var(--fill);border-radius:999px;padding:7px 12px;font-size:.92rem;font-weight:600;cursor:pointer}
+.hours button[aria-pressed="true"]{background:var(--accent);color:var(--on-accent)}
 
-.time-box{display:flex;flex-direction:column;gap:8px}
-.time-head{display:flex;justify-content:space-between;align-items:center}
-.time-val{font-size:1rem;font-weight:600}
-.link-btn{border:0;background:none;color:var(--accent);font:inherit;font-size:.9rem;font-weight:500;cursor:pointer;padding:0}
-.link-btn:hover{text-decoration:underline}
+/* Summary bar */
+.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 4px 10px}
+.summary{margin:0;color:var(--muted);font-size:.92rem;line-height:1.3}
+.seg.small{flex:0 0 auto}
+.seg.small button{font-size:.85rem;padding:6px 10px}
 
-input[type=range]{width:100%;accent-color:var(--accent);height:6px;border-radius:3px;background:var(--fill);outline:none;cursor:pointer}
+/* Banners */
+.banner{display:flex;align-items:center;gap:12px;background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px}
+.banner p{margin:0;flex:1;color:var(--muted);font-size:.92rem}
+.btn-accent{border:0;background:var(--accent);color:var(--on-accent);font-weight:600;font-size:.92rem;padding:8px 15px;border-radius:999px;cursor:pointer;white-space:nowrap}
 
-.summary{font-weight:500;color:var(--muted);font-size:.95rem;margin:0 4px 16px;padding-left:2px}
+/* Time view */
+.tgroup{margin-top:20px}
+.tgroup h2{margin:0 4px 8px;font-size:1.45rem;font-weight:700;letter-spacing:-.03em}
+.tgroup h2 span{font-size:.85rem;font-weight:400;color:var(--muted);letter-spacing:0;margin-left:4px}
+.rows{background:var(--card);border-radius:14px;overflow:hidden}
+.row{display:flex;align-items:center;gap:12px;width:100%;text-align:left;text-decoration:none;color:inherit;background:none;border:0;padding:12px 14px;cursor:pointer}
+.row + .row{border-top:.5px solid var(--hair)}
+.row:active{background:var(--fill)}
+.row .who{flex:1;min-width:0}
+.row strong{display:block;font-weight:600;font-size:1rem}
+.row small{display:block;color:var(--muted);font-size:.84rem;margin-top:1px}
+.price{color:var(--accent);font-weight:600;font-size:1rem;white-space:nowrap}
+.row.busy{opacity:.5;cursor:progress}
 
-.cards{display:grid;gap:16px;list-style:none;margin:0;padding:0}
-.card{background:var(--card);border-radius:20px;padding:22px;box-shadow:var(--shadow);transition:transform .2s ease, opacity .2s ease}
-.card.dim{opacity:.65}
-.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.card h3{font-size:1.15rem;font-weight:600;letter-spacing:-.02em;margin:0}
-.sub{color:var(--muted);font-size:.85rem;margin:3px 0 0}
+/* Club view */
+.club{background:var(--card);border-radius:16px;padding:14px 14px 12px;margin-top:12px}
+.club-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.club h3{margin:0;font-size:1.08rem;font-weight:600;letter-spacing:-.02em}
+.club .sub{margin:2px 0 0;color:var(--muted);font-size:.85rem}
+.badge{flex:0 0 auto;font-size:.76rem;font-weight:600;padding:3px 9px;border-radius:999px;background:var(--fill);color:var(--muted);white-space:nowrap}
+.badge.on{background:color-mix(in srgb,var(--green) 16%,transparent);color:var(--green)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 2px}
+.chip{display:inline-flex;flex-direction:column;align-items:center;min-width:66px;border:0;background:var(--fill);border-radius:10px;padding:7px 10px;
+  font-size:.95rem;font-weight:600;color:var(--ink);text-decoration:none;cursor:pointer;line-height:1.25}
+.chip small{font-size:.72rem;font-weight:500;color:var(--accent)}
+.chip.busy{opacity:.5;cursor:progress}
+.msg{color:var(--muted);font-size:.9rem;margin:10px 0 2px}
+.links{display:flex;align-items:center;gap:16px;margin-top:12px;padding-top:10px;border-top:.5px solid var(--hair)}
+.links a,.links button{color:var(--accent);text-decoration:none;font-size:.92rem;background:none;border:0;padding:0;cursor:pointer;white-space:nowrap}
+.links .first{margin-right:auto;font-weight:600}
+.empty{background:var(--card);border-radius:14px;padding:22px 16px;text-align:center;color:var(--muted);font-size:.95rem;margin-top:12px}
+.foot{color:var(--muted);font-size:.8rem;margin:22px 4px 0;line-height:1.4}
 
-.badge{flex:0 0 auto;font-size:.75rem;font-weight:600;padding:5px 12px;border-radius:999px;white-space:nowrap;letter-spacing:-.01em}
-.badge.on{background:var(--green-bg);color:var(--green)}
-.badge.off{background:var(--grey-bg);color:var(--muted)}
+/* Accounts */
+.gtitle{margin:22px 4px 8px;font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.02em}
+.acct{display:flex;align-items:center;gap:12px;padding:12px 0}
+.acct + .acct{border-top:.5px solid var(--hair)}
+.acct .who{flex:1;min-width:0}
+.acct strong{display:block;font-weight:600;font-size:1rem}
+.acct small{display:block;font-size:.84rem;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct small.ok{color:var(--green)}
+.btn-ghost{border:0;background:var(--fill);color:var(--accent);font-weight:600;font-size:.88rem;padding:7px 13px;border-radius:999px;cursor:pointer;white-space:nowrap}
 
-.slots{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 6px}
-.slot{display:inline-flex;flex-direction:column;align-items:center;text-decoration:none;color:var(--ink);
-  background:var(--fill);border-radius:12px;padding:8px 12px;min-width:72px;font-size:.95rem;font-weight:600;transition:transform .15s, background .15s}
-.slot small{font-size:.68rem;font-weight:400;color:var(--muted);margin-top:2px}
-.slot:hover{background:var(--accent);color:var(--accent-ink);transform:translateY(-2px)}
-.slot:hover small{color:rgba(255,255,255,.8)}
+/* Tab bar */
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;justify-content:center;gap:0;
+  background:var(--tabbar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+  border-top:.5px solid var(--hair);padding:6px 0 calc(6px + env(safe-area-inset-bottom,0px))}
+.tab{flex:0 1 160px;border:0;background:none;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:.68rem;font-weight:500;color:var(--muted);cursor:pointer;padding:4px 0}
+.tab svg{width:26px;height:26px}
+.tab[aria-selected="true"]{color:var(--accent)}
 
-.msg{color:var(--muted);font-size:.9rem;margin:14px 0 4px}
+/* Sheet */
+dialog{border:0;padding:0;background:var(--card);color:var(--ink);width:100%;max-width:520px;border-radius:18px;
+  margin:auto auto 0;max-height:92vh}
+@media (min-width:600px){dialog{margin:auto;width:calc(100% - 32px)}}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+.sheet{padding:22px 18px calc(22px + env(safe-area-inset-bottom,0px))}
+.sheet h2{font-size:1.3rem;margin:0 0 6px;letter-spacing:-.025em}
+.sheet .sub{color:var(--muted);font-size:.9rem;margin:0}
+.field{display:block;margin-top:14px}
+.field span{display:block;font-size:.8rem;color:var(--muted);margin:0 0 6px 4px}
+.field input{width:100%;font:inherit;font-size:1rem;color:var(--ink);background:var(--bg);border:0;border-radius:12px;padding:13px 14px}
+.btn-wide{display:block;width:100%;margin-top:18px;border:0;border-radius:14px;padding:14px;font-weight:600;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.btn-wide:disabled{opacity:.5;cursor:default}
+.status{font-size:.9rem;color:var(--muted);min-height:1.3em;margin:10px 2px 0}
+.status.ok{color:var(--green)} .status.bad{color:var(--red)}
+.manual{margin-top:14px;border-top:.5px solid var(--hair);padding-top:12px;font-size:.9rem}
+.manual summary{cursor:pointer;color:var(--accent)}
+.manual code{font-size:.85em;background:var(--fill);padding:1px 5px;border-radius:5px}
+.manual textarea{width:100%;min-height:80px;border:0;border-radius:12px;background:var(--bg);color:var(--ink);font:13px ui-monospace,Menlo,Consolas,monospace;padding:10px;resize:vertical;margin-top:8px}
+.rowend{display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
+.err{color:var(--red);font-size:.86rem;min-height:1.1em;margin:6px 0 0}
 
-.links{display:flex;align-items:center;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid var(--hair);flex-wrap:wrap}
-.links a,.links button{white-space:nowrap;color:var(--muted);text-decoration:none;font:inherit;font-size:.88rem;font-weight:500;background:none;border:0;padding:6px 12px;border-radius:8px;cursor:pointer;transition:background .15s, color .15s}
-.links a:hover,.links button:hover{background:var(--fill);color:var(--ink)}
-.links .primary{background:var(--accent);color:var(--accent-ink);border-radius:999px;padding:8px 20px;font-weight:600;margin-right:auto}
-.links .primary:hover{opacity:.9;background:var(--accent);color:var(--accent-ink)}
-
-.foot{color:var(--muted);font-size:.8rem;margin:32px 4px 0;text-align:center;line-height:1.4}
-
-a:focus-visible,button:focus-visible,input:focus-visible{outline:3px solid var(--accent);outline-offset:2px;border-radius:8px}
-
-dialog{border:0;border-radius:24px;padding:0;max-width:460px;width:calc(100% - 32px);background:var(--card);color:var(--ink);box-shadow:0 20px 40px rgba(0,0,0,0.2)}
-dialog::backdrop{background:rgba(0,0,0,.4);backdrop-filter:blur(8px)}
-.sheet{padding:28px}
-.sheet h2{font-size:1.3rem;font-weight:600;margin:0 0 6px;letter-spacing:-.02em}
-.sheet textarea{width:100%;min-height:90px;border:1px solid var(--hair);border-radius:12px;background:var(--bg);color:var(--ink);
-  font:13px ui-monospace,Menlo,Consolas,monospace;padding:12px;resize:vertical}
-.sheet .row{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
-.btn{border:0;border-radius:999px;padding:10px 20px;font:inherit;font-size:.9rem;font-weight:600;cursor:pointer;transition:opacity .15s}
-.btn:hover{opacity:.9}
-.btn.fill{background:var(--accent);color:var(--accent-ink)}
-.btn.plain{background:var(--fill);color:var(--ink)}
-.field{display:block;margin-top:16px}
-.field span{display:block;font-size:.8rem;font-weight:600;color:var(--muted);margin:0 0 6px 4px;text-transform:uppercase;letter-spacing:.05em}
-.field input{width:100%;font:inherit;font-size:1rem;color:var(--ink);background:var(--bg);border:1px solid var(--hair);border-radius:12px;padding:12px 14px;outline:none;transition:border-color .15s}
-.field input:focus{border-color:var(--accent)}
-.btn.google{display:block;width:100%;margin:20px 0 0;padding:14px;font-weight:600;background:var(--ink);color:var(--bg);border-radius:14px}
-.btn.google:disabled{opacity:.4;cursor:default}
-.status{font-size:.88rem;color:var(--muted);min-height:1.4em;margin:12px 2px 0;font-weight:500}
-.status.ok{color:var(--green)} .status.bad{color:#FF3B30}
-.manual{margin-top:16px;border-top:1px solid var(--hair);padding-top:14px;font-size:.9rem}
-.manual summary{cursor:pointer;color:var(--accent);font-weight:500}
-.err{color:#FF3B30;font-size:.85rem;min-height:1.2em;margin:8px 0 0}
+.toast{position:fixed;left:0;right:0;margin:0 auto;width:fit-content;max-width:min(92vw,440px);z-index:30;
+  bottom:calc(76px + env(safe-area-inset-bottom,0px));transform:translateY(16px);opacity:0;pointer-events:none;
+  background:var(--ink);color:var(--bg);padding:12px 16px;border-radius:14px;font-size:.9rem;transition:opacity .2s,transform .2s}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.bad{background:var(--red);color:#fff}
+a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:2px;border-radius:8px}
 @media (prefers-reduced-motion: reduce){*{transition:none!important}}
 </style>
 </head>
 <body>
-<main class="wrap">
-  <header>
-    <h1>Padel à Orléans</h1>
-    <p class="lede" id="lede">Quatre clubs, un seul endroit pour trouver ton terrain.</p>
-  </header>
-
-  <div class="controls">
-    <div><p class="label">Jour</p><div class="seg" id="days" role="group" aria-label="Jour"></div></div>
-    <div id="durBox" hidden><p class="label">Durée</p>
+<main class="screen" id="scr-slots">
+  <p class="kicker">Padel à Orléans</p>
+  <div class="titlerow"><h1>Créneaux</h1><button class="pill" id="nowBtn" type="button">Maintenant</button></div>
+  <div class="days" id="days" role="group" aria-label="Jour"></div>
+  <section class="group">
+    <div class="grow" id="durRow"><span class="glabel">Durée</span>
       <div class="seg" id="durs" role="group" aria-label="Durée">
         <button type="button" data-d="60" aria-pressed="false">1 h</button>
         <button type="button" data-d="90" aria-pressed="true">1 h 30</button>
         <button type="button" data-d="120" aria-pressed="false">2 h</button>
       </div></div>
-    <div class="time-box">
-      <div class="time-head"><span class="label" style="margin:0">Heure de début</span><span class="time-val" id="timeLbl">À 19h00</span><button class="link-btn" id="nowBtn" type="button">Maintenant</button></div>
-      <input type="range" id="time" min="8" max="23.5" step="0.5" value="19" aria-label="Heure">
+    <div class="grow"><span class="glabel" id="hoursLbl">Dès</span><div class="hours" id="hours" role="group" aria-label="Heure"></div></div>
+  </section>
+  <div class="bar">
+    <p class="summary" id="summary" aria-live="polite"></p>
+    <div class="seg small" id="views" role="group" aria-label="Affichage">
+      <button type="button" data-v="club" aria-pressed="false">Par club</button>
+      <button type="button" data-v="time" aria-pressed="true">Par horaire</button>
     </div>
   </div>
-
-  <p class="summary" id="summary" aria-live="polite"></p>
-  <ul class="cards" id="cards"></ul>
+  <div id="banners"></div>
+  <div id="list"></div>
   <p class="foot" id="foot"></p>
 </main>
+
+<main class="screen" id="scr-accounts" hidden>
+  <p class="kicker">Padel à Orléans</p>
+  <div class="titlerow"><h1>Comptes</h1></div>
+  <section class="group" id="acctList"></section>
+  <p class="foot" id="acctFoot"></p>
+  <h3 class="gtitle">Apparence</h3>
+  <section class="group">
+    <div class="grow"><span class="glabel">Thème</span>
+      <div class="seg" id="themeSeg"><button type="button" data-v="auto">Auto</button><button type="button" data-v="light">Clair</button><button type="button" data-v="dark">Sombre</button></div></div>
+    <div class="grow"><span class="glabel">Couleur</span>
+      <div class="seg" id="accentSeg"><button type="button" data-v="blue">Bleu</button><button type="button" data-v="green">Vert</button><button type="button" data-v="orange">Orange</button></div></div>
+  </section>
+  <h3 class="gtitle" id="viewTitle">Au démarrage</h3>
+  <section class="group" id="viewGroup">
+    <div class="grow"><span class="glabel">Vue</span>
+      <div class="seg" id="defViewSeg"><button type="button" data-v="time">Par horaire</button><button type="button" data-v="club">Par club</button></div></div>
+  </section>
+</main>
+
+<nav class="tabbar" role="tablist" aria-label="Sections">
+  <button class="tab" role="tab" id="tab-slots" aria-selected="true" type="button">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/><circle cx="8.5" cy="14.5" r="1" fill="currentColor"/><circle cx="12" cy="14.5" r="1" fill="currentColor"/></svg>
+    Créneaux</button>
+  <button class="tab" role="tab" id="tab-accounts" aria-selected="false" type="button">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="10" r="3"/><path d="M6.5 18.2c1.3-2 3.2-3 5.5-3s4.2 1 5.5 3"/></svg>
+    Comptes</button>
+</nav>
 
 <dialog id="sheet">
   <form class="sheet" id="credForm" autocomplete="on">
@@ -856,28 +1113,29 @@ dialog::backdrop{background:rgba(0,0,0,.4);backdrop-filter:blur(8px)}
     <p class="sub" id="sheetText"></p>
     <label class="field"><span>E-mail</span><input type="email" id="cEmail" autocomplete="username" required></label>
     <label class="field"><span>Mot de passe</span><input type="password" id="cPass" autocomplete="current-password" required></label>
-    <button class="btn google" id="gBtn" type="submit">Se connecter</button>
+    <button class="btn-wide" id="gBtn" type="submit">Se connecter</button>
     <p class="status" id="gMsg" aria-live="polite"></p>
     <details class="manual" id="manual">
       <summary>Autres façons de se connecter</summary>
-      <p class="sub" style="margin-top:8px">Si ton compte n’a pas de mot de passe (créé avec Google), connecte-toi toi-même dans une fenêtre Chrome :</p>
-      <button class="btn plain" id="winBtn" type="button" style="margin-top:10px">Ouvrir une fenêtre Chrome</button>
+      <p class="sub" style="margin-top:8px">Compte créé avec Google, sans mot de passe ? Connecte-toi toi-même dans une fenêtre Chrome :</p>
+      <div class="rowend" style="justify-content:flex-start"><button class="btn-ghost" id="winBtn" type="button">Ouvrir une fenêtre Chrome</button></div>
       <div id="keyBox">
         <p class="sub" style="margin-top:14px">Ou colle la valeur d’<code>authorization</code> copiée dans les outils du navigateur (F12, Réseau) :</p>
         <textarea id="tok" placeholder="eyJraWQiOi…" spellcheck="false" autocomplete="off"></textarea>
         <p class="err" id="tokErr"></p>
-        <div class="row"><button class="btn plain" id="tokSave" type="button">Enregistrer la clé</button></div>
+        <div class="rowend"><button class="btn-ghost" id="tokSave" type="button">Enregistrer la clé</button></div>
       </div>
     </details>
-    <div class="row" style="margin-top:20px"><button class="btn plain" id="sheetClose" type="button">Fermer</button></div>
+    <div class="rowend"><button class="btn-ghost" id="sheetClose" type="button">Fermer</button></div>
   </form>
 </dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
 const LIVE = window.PADEL_LIVE === true;
 const H = (wk, we) => ({wk, we});
 const CLUBS = [
-  {id:"4padel", name:"4PADEL Orléans", city:"Fleury-les-Aubrais", courts:"6 pistes indoor",
+  {id:"4padel", name:"4PADEL Orléans", city:"Fleury-les-Aubrais", courts:"6 pistes indoor", account:true,
    address:"113 rue de Curembourg, 45400 Fleury-les-Aubrais", phone:"02 38 58 99 37",
    hours:H([9,23.5],[9,21.5]), book:"https://www.4padel.fr/reservations/slots"},
   {id:"letpadel-pryve", name:"Let Padel Saint-Pryvé", city:"Saint-Pryvé-Saint-Mesmin", courts:"4 pistes",
@@ -886,211 +1144,279 @@ const CLUBS = [
   {id:"letpadel-fleury", name:"Let Padel Fleury", city:"Fleury-les-Aubrais", courts:"4 pistes",
    address:"20 rue André Dessaux, 45400 Fleury-les-Aubrais", phone:"02 18 69 32 22",
    hours:H([10,24],[9,21]), book:"https://letpadel.doinsport.club/home"},
-  {id:"smash", name:"Smash Padel", city:"Saint-Denis-en-Val", courts:"5 pistes + 2 singles",
+  {id:"smash", name:"Smash Padel", city:"Saint-Denis-en-Val", courts:"5 pistes + 2 singles", account:true,
    address:"2951 route de Sandillon, 45560 Saint-Denis-en-Val", phone:"02 19 23 11 08",
    hours:H([9,23],[9,23]), book:"https://smashpadel.mymobileapp.fr/"}
 ];
+const CLUB = Object.fromEntries(CLUBS.map(c=>[c.id,c]));
 const DAYS = ["dim.","lun.","mar.","mer.","jeu.","ven.","sam."];
-const S = {offset:0, t:19, dur:90, data:null, loading:false, err:null};
+const HOURS = Array.from({length:15},(_,i)=>8+i);   // 8h → 22h
+
+/* Réglages (thème, couleur, vue au démarrage) */
+const PREF_KEY="padel-orleans-prefs";
+let PREFS={theme:"auto", accent:"blue", view:"time"};
+try{ Object.assign(PREFS, JSON.parse(localStorage.getItem(PREF_KEY)||"{}")); }catch(e){}
+function savePrefs(){ try{ localStorage.setItem(PREF_KEY, JSON.stringify(PREFS)); }catch(e){} }
+function applyPrefs(){
+  const r=document.documentElement;
+  if(PREFS.theme==="auto") r.removeAttribute("data-theme"); else r.setAttribute("data-theme", PREFS.theme);
+  r.setAttribute("data-accent", PREFS.accent);
+  [["themeSeg",PREFS.theme],["accentSeg",PREFS.accent],["defViewSeg",PREFS.view]].forEach(([id,v])=>
+    document.querySelectorAll(`#${id} button`).forEach(b=>b.setAttribute("aria-pressed", b.dataset.v===v?"true":"false")));
+}
+
+const S = {offset:0, t:18, dur:90, view:LIVE?PREFS.view:"club", data:null, loading:false, err:null, accounts:null};
 const $ = id => document.getElementById(id);
 const fmt = t => `${Math.floor(t)%24}h${String(Math.round((t%1)*60)).padStart(2,"0")}`;
 const dateFor = o => {const d=new Date(); d.setHours(12,0,0,0); d.setDate(d.getDate()+o); return d;};
 const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 const toH = s => {const [h,m]=s.split(":").map(Number); return h+m/60;};
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const plural = (n, w) => `${n} ${w}${n>1?"s":""}`;
+const shortPrice = p => p ? p.replace(" €/joueur"," €") : "";
+function press(box, match){ box.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed", match(b)?"true":"false")); }
+const mapUrl = c => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name+" "+c.address)}`;
 
-function press(box, i){ box.querySelectorAll("button").forEach((b,j)=>b.setAttribute("aria-pressed", j===i?"true":"false")); }
-
+/* Contrôles */
 function buildDays(){
   const box=$("days");
   for(let i=0;i<7;i++){
     const d=dateFor(i), b=document.createElement("button");
-    b.type="button";
-    b.innerHTML=`${i===0?"Auj.":i===1?"Demain":DAYS[d.getDay()]}<small>${d.getDate()}/${d.getMonth()+1}</small>`;
-    b.setAttribute("aria-pressed", i===0?"true":"false");
-    b.onclick=()=>{S.offset=i; press(box,i); load();};
+    b.type="button"; b.className="day";
+    b.innerHTML=`<small>${i===0?"Auj.":DAYS[d.getDay()]}</small><b>${d.getDate()}</b>`;
+    b.setAttribute("aria-label", d.toLocaleDateString("fr-FR",{weekday:"long",day:"numeric",month:"long"}));
+    b.onclick=()=>{S.offset=i; press(box,x=>x===b); load();};
     box.appendChild(b);
   }
+  press(box,(x,)=>x===box.children[0]);
+}
+function buildHours(){
+  const box=$("hours");
+  box.innerHTML=HOURS.map(h=>`<button type="button" data-h="${h}">${h}h</button>`).join("");
+  box.querySelectorAll("button").forEach(b=>b.onclick=()=>{S.t=+b.dataset.h; syncHours(); render();});
+}
+function syncHours(){
+  const box=$("hours"); press(box,b=>+b.dataset.h===S.t);
+  const on=box.querySelector('[aria-pressed="true"]');
+  if(on) box.scrollTo({left:on.offsetLeft-box.offsetLeft-40, behavior:"smooth"});
+}
+function setNow(){
+  const n=new Date(); S.t=Math.min(22,Math.max(8,n.getHours()));
+  syncHours();
+  if(S.offset!==0){ S.offset=0; press($("days"),b=>b===$("days").children[0]); load(); } else render();
 }
 
+/* Données */
 async function load(){
   if(!LIVE){ render(); return; }
   S.loading=true; S.err=null; render();
   try{
     const r=await fetch(`/api/slots?date=${iso(dateFor(S.offset))}&duration=${S.dur}`);
-    if(!r.ok) throw new Error(`Le serveur local a répondu ${r.status}.`);
+    if(!r.ok) throw new Error(`L’outil a répondu ${r.status}.`);
     S.data=await r.json();
-  }catch(e){ S.data=null; S.err=e.message||"Le serveur local ne répond pas."; }
+  }catch(e){ S.data=null; S.err="L’outil sur ton PC ne répond pas. Relance lancer_padel.bat."; }
   S.loading=false; render();
 }
 
-function bookingURL(c, date, time, duration){
-  const u = new URL(c.book);
-  if(c.id === "4padel"){
-    u.searchParams.set("center", "9");
-    u.searchParams.set("date", date);
-    u.searchParams.set("time", time);
-    u.searchParams.set("duration", String(duration));
-  } else if(c.id === "letpadel-pryve" || c.id === "letpadel-fleury"){
-    u.searchParams.set("clubId", c.id === "letpadel-pryve" ? "6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f" : "fc96f79e-ef94-4fa6-9b01-d494eccaa54f");
-    u.searchParams.set("date", date);
-    u.searchParams.set("time", time);
-    u.searchParams.set("duration", String(duration));
-  } else if(c.id === "smash"){
-    u.searchParams.set("myDate", date.split("-").reverse().join("/"));
-    u.searchParams.set("heure", time);
-    u.searchParams.set("duree", String(duration));
-    u.searchParams.set("id_sport", "2");
-  }
-  return u.toString();
+function clubState(c){
+  const x=((S.data||{}).clubs||{})[c.id]||{status:"not_configured"};
+  const now=new Date(), nowH=now.getHours()+now.getMinutes()/60;
+  const slots = x.status==="ok" ? (x.slots||[]).filter(s=>toH(s.time)>=S.t && !(S.offset===0 && toH(s.time)<nowH)) : [];
+  return {state:x.status, msg:x.message||"", url:x.book_url||c.book, slots};
 }
 
-function linksHTML(c){
-  const map=`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name+" "+c.address)}`;
-  const booking=bookingURL(c, iso(dateFor(S.offset)), fmt(S.t).replace("h",":"), S.dur);
-  return `<div class="links">
-    <a class="primary" href="${booking}" target="_blank" rel="noopener">Réserver</a>
-    <a href="${map}" target="_blank" rel="noopener">Itinéraire</a>
-    <a href="tel:${c.phone.replace(/\s/g,"")}">Appeler</a></div>`;
-}
-
+/* Rendu */
 function render(){
   const d=dateFor(S.offset), we=d.getDay()===0||d.getDay()===6;
-  const now=new Date(), nowH=now.getHours()+now.getMinutes()/60;
-  $("timeLbl").textContent = LIVE ? `À partir de ${fmt(S.t)}` : `À ${fmt(S.t)}`;
-  const dayTxt = S.offset===0?"aujourd’hui":S.offset===1?"demain":`${DAYS[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}`;
+  const dayTxt = S.offset===0?"aujourd’hui":S.offset===1?"demain":`${DAYS[d.getDay()]} ${d.getDate()}`;
+  $("banners").innerHTML=""; 
+  if(!LIVE) return renderStatic(d, we, dayTxt);
+  if(S.loading && !S.data){ $("summary").textContent="Recherche des créneaux…"; $("list").innerHTML=""; return; }
+  if(S.err){ $("summary").textContent=""; $("list").innerHTML=`<div class="empty">${esc(S.err)}</div>`; return; }
 
-  let rows = CLUBS.map(c=>{
-    const [o,cl]=we?c.hours.we:c.hours.wk;
-    const r={c,o,cl,open:S.t>=o&&S.t<cl,slots:null,state:null,msg:null};
-    if(LIVE && S.data){
-      const x=(S.data.clubs||{})[c.id]||{status:"not_configured"};
-      r.state=x.status; r.msg=x.message||null;
-      if(x.status==="ok") r.slots=(x.slots||[]).filter(s=>toH(s.time)>=S.t && !(S.offset===0 && toH(s.time)<nowH));
-    }
-    return r;
-  });
+  const rows=CLUBS.map(c=>({c,...clubState(c)}));
+  // Bandeaux : comptes à connecter, clubs injoignables
+  $("banners").innerHTML = rows.filter(r=>r.state==="needs_token"||r.state==="error").map(r=>
+    r.state==="needs_token"
+      ? `<div class="banner"><p>${esc(r.c.name)} n’est pas connecté : ses créneaux manquent.</p><button class="btn-accent" type="button" data-connect="${r.c.id}">Connecter</button></div>`
+      : `<div class="banner"><p>${esc(r.c.name)} ne répond pas : ${esc(r.msg||"réessaie plus tard")}</p></div>`).join("");
 
-  if(LIVE && S.data){
-    rows.sort((a,b)=>(b.slots?b.slots.length:-1)-(a.slots?a.slots.length:-1));
-    const total=rows.reduce((n,r)=>n+(r.slots?r.slots.length:0),0);
-    const clubsWith=rows.filter(r=>r.slots&&r.slots.length).length;
-    $("summary").textContent = total
-      ? `${total} créneau${total>1?"x":""} libre${total>1?"s":""} ${dayTxt} dans ${clubsWith} club${clubsWith>1?"s":""}.`
-      : `Aucun créneau libre ${dayTxt} à partir de ${fmt(S.t)} dans les clubs connectés.`;
-  } else if(LIVE){
-    $("summary").textContent = S.loading ? "Recherche des créneaux en cours…" : (S.err||"");
-  } else {
-    rows.sort((a,b)=>b.open-a.open);
-    const n=rows.filter(r=>r.open).length;
-    $("summary").textContent = n ? `${n} club${n>1?"s":""} sur 4 ouvert${n>1?"s":""} ${dayTxt} à ${fmt(S.t)}.`
-                                 : `Aucun club ouvert ${dayTxt} à ${fmt(S.t)}.`;
-  }
+  const total=rows.reduce((n,r)=>n+r.slots.length,0), nClubs=rows.filter(r=>r.slots.length).length;
+  $("summary").textContent = total
+    ? `${plural(total,"créneau")} ${total>1?"libres":"libre"} ${dayTxt}, ${plural(nClubs,"club")}`.replace("créneaus","créneaux")
+    : `Aucun créneau libre ${dayTxt} dès ${S.t}h`;
 
-  $("cards").innerHTML = rows.map(r=>{
-    const c=r.c; let badge="", body="", dim=false;
-    if(LIVE && S.data){
-      if(r.state==="ok"){
-        const n=r.slots.length;
-        badge = n ? `<span class="badge on">${n} libre${n>1?"s":""}</span>` : `<span class="badge off">Complet</span>`;
-        dim = !n;
-        body = n ? `<div class="slots">${r.slots.map(s=>{const url=bookingURL(c, iso(dateFor(S.offset)), s.time, S.dur); return `<a class="slot" href="${url}" target="_blank" rel="noopener" title="Réserver le ${iso(dateFor(S.offset))} à ${s.time} — ${s.courts} piste${s.courts>1?"s":""}">${esc(s.time.replace(":","h"))}<small>${s.price?esc(s.price):s.courts+" piste"+(s.courts>1?"s":"")}</small></a>`;}).join("")}</div>` : "";
-      } else if(r.state==="needs_token"){
-        badge=`<span class="badge off">Non connecté</span>`;
-        body=`<p class="msg">${esc(r.msg||"Connecte ton compte pour voir les créneaux.")}</p>`;
-      } else if(r.state==="error"){
-        badge=`<span class="badge off">Indisponible</span>`;
-        body=`<p class="msg">${esc(r.msg||"Le club n’a pas répondu.")}</p>`;
-      } else {
-        badge=`<span class="badge off">Lien seulement</span>`;
-        body=`<p class="msg">Créneaux pas encore branchés pour ce club : ouvre sa page de réservation.</p>`;
-      }
-    } else if(LIVE){
-      badge=`<span class="badge off">Chargement…</span>`;
-    } else {
-      badge = r.open ? `<span class="badge on">Ouvert jusqu’à ${fmt(r.cl)}</span>`
-                     : `<span class="badge off">${S.t<r.o?`Ouvre à ${fmt(r.o)}`:"Fermé"}</span>`;
-      dim=!r.open;
-    }
-    const extra = (LIVE && (c.id==="4padel"||c.id==="smash")) ? `<button type="button" data-act="token" data-p="${c.id}">${r.state==="needs_token"?"Se connecter":"Compte"}</button>` : "";
-    return `<li class="card${dim?" dim":""}">
-      <div class="head"><div><h3>${c.name}</h3><p class="sub">${c.city}, ${c.courts}</p></div>${badge}</div>
-      ${body}${linksHTML(c).replace("</div>", extra+"</div>")}</li>`;
-  }).join("");
-  document.querySelectorAll('[data-act="token"]').forEach(b=>b.onclick=()=>openSheet(b.dataset.p));
+  $("list").innerHTML = S.view==="time" ? renderByTime(rows) : renderByClub(rows);
+  wire();
 }
 
+function slotTarget(r, s){
+  // Smash : réservation de la piste ouverte directement ; autres clubs : page de planning du club.
+  return s.book ? {tag:"button", attrs:`type="button" data-book='${esc(JSON.stringify(s.book))}'`}
+                : {tag:"a", attrs:`href="${esc(r.url)}" target="_blank" rel="noopener"`};
+}
+
+function renderByTime(rows){
+  const byTime={};
+  rows.forEach(r=>r.slots.forEach(s=>(byTime[s.time] ||= []).push({r,s})));
+  const times=Object.keys(byTime).sort();
+  if(!times.length) return `<div class="empty">Rien de libre à partir de ${S.t}h. Essaie une heure plus tôt, une autre durée ou un autre jour.</div>`;
+  return times.map(t=>{
+    const items=byTime[t];
+    return `<div class="tgroup"><h2>${t.replace(":","h")}<span>${plural(items.length,"club")}</span></h2><div class="rows">${
+      items.map(({r,s})=>{ const g=slotTarget(r,s);
+        return `<${g.tag} class="row" ${g.attrs}><span class="who"><strong>${esc(r.c.name)}</strong><small>${esc(r.c.city)} · ${plural(s.courts,"piste")}</small></span><span class="price">${esc(shortPrice(s.price))}</span></${g.tag}>`;
+      }).join("")}</div></div>`;
+  }).join("");
+}
+
+function renderByClub(rows){
+  const sorted=[...rows].sort((a,b)=>b.slots.length-a.slots.length);
+  return sorted.map(r=>{
+    const c=r.c, n=r.slots.length;
+    let badge, body="";
+    if(r.state==="ok"){
+      badge = n ? `<span class="badge on">${plural(n,"libre")}</span>` : `<span class="badge">Complet</span>`;
+      body = n ? `<div class="chips">${r.slots.map(s=>{const g=slotTarget(r,s);
+        return `<${g.tag} class="chip" ${g.attrs}>${s.time.replace(":","h")}<small>${esc(shortPrice(s.price)||plural(s.courts,"piste"))}</small></${g.tag}>`;}).join("")}</div>` : "";
+    } else if(r.state==="needs_token"){ badge=`<span class="badge">Non connecté</span>`; }
+    else if(r.state==="error"){ badge=`<span class="badge">Indisponible</span>`; }
+    else { badge=`<span class="badge">Lien seulement</span>`; body=`<p class="msg">Créneaux pas encore lus pour ce club.</p>`; }
+    return `<article class="club"><div class="club-head"><div><h3>${esc(c.name)}</h3><p class="sub">${esc(c.city)}, ${esc(c.courts)}</p></div>${badge}</div>${body}
+      <div class="links"><a class="first" href="${esc(r.url)}" target="_blank" rel="noopener">Réserver</a>
+      <a href="${mapUrl(c)}" target="_blank" rel="noopener">Itinéraire</a><a href="tel:${c.phone.replace(/\s/g,"")}">Appeler</a></div></article>`;
+  }).join("");
+}
+
+function renderStatic(d, we, dayTxt){
+  const rows=CLUBS.map(c=>{const [o,cl]=we?c.hours.we:c.hours.wk; return {c,o,cl,open:S.t>=o&&S.t<cl};}).sort((a,b)=>b.open-a.open);
+  const n=rows.filter(r=>r.open).length;
+  $("summary").textContent = n ? `${plural(n,"club")} ouvert${n>1?"s":""} ${dayTxt} à ${S.t}h` : `Aucun club ouvert ${dayTxt} à ${S.t}h`;
+  $("list").innerHTML = rows.map(({c,o,cl,open})=>`<article class="club"><div class="club-head"><div><h3>${esc(c.name)}</h3><p class="sub">${esc(c.city)}, ${esc(c.courts)}</p></div>
+    <span class="badge${open?" on":""}">${open?`Ouvert jusqu’à ${fmt(cl)}`:(S.t<o?`Ouvre à ${fmt(o)}`:"Fermé")}</span></div>
+    <div class="links"><a class="first" href="${c.book}" target="_blank" rel="noopener">Réserver</a>
+    <a href="${mapUrl(c)}" target="_blank" rel="noopener">Itinéraire</a><a href="tel:${c.phone.replace(/\s/g,"")}">Appeler</a></div></article>`).join("");
+}
+
+function wire(){
+  document.querySelectorAll("[data-book]").forEach(el=>el.onclick=()=>openBooking(el, JSON.parse(el.dataset.book)));
+  document.querySelectorAll("[data-connect]").forEach(el=>el.onclick=()=>openSheet(el.dataset.connect));
+}
+
+/* Ouvrir la réservation d'une piste (Smash) */
+function toast(msg, bad){
+  const t=$("toast"); t.textContent=msg; t.className="toast show"+(bad?" bad":"");
+  clearTimeout(toast._t); toast._t=setTimeout(()=>t.className="toast", 6000);
+}
+async function openBooking(el, book){
+  if(el.classList.contains("busy")) return;
+  el.classList.add("busy"); toast("Ouverture de la réservation dans Chrome…");
+  try{
+    const r=await fetch("/api/open",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...book, duration:S.dur})});
+    const j=await r.json(); toast(j.message||j.error||"Terminé.", !r.ok);
+  }catch(e){ toast("L’outil sur ton PC ne répond pas. Relance-le.", true); }
+  el.classList.remove("busy");
+}
+
+/* Comptes */
+async function refreshAccounts(){
+  if(!LIVE){
+    $("acctList").innerHTML=`<div class="acct"><span class="who"><strong>Comptes des clubs</strong><small>Ils se gèrent dans l’outil installé sur ton PC.</small></span></div>`;
+    $("acctFoot").textContent="Cette page en ligne affiche les horaires d’ouverture. Les créneaux libres s’affichent dans l’outil lancé avec lancer_padel.bat.";
+    $("viewTitle").hidden=true; $("viewGroup").hidden=true; return;
+  }
+  try{ S.accounts=await (await fetch("/api/accounts")).json(); }catch(e){ S.accounts={}; }
+  const a=S.accounts||{};
+  const line=(id,label)=>{ const x=a[id]||{}; 
+    const status = x.connected ? `<small class="ok">Connecté${x.until?` jusqu’au ${esc(x.until)}`:""}${x.email?` · ${esc(x.email)}`:""}</small>`
+                               : `<small>${x.email?`Session expirée · ${esc(x.email)}`:"Non connecté"}</small>`;
+    return `<div class="acct"><span class="who"><strong>${label}</strong>${status}</span><button class="btn-ghost" type="button" data-connect="${id}">${x.connected?"Modifier":"Connecter"}</button></div>`; };
+  $("acctList").innerHTML = line("4padel","4PADEL Orléans") + line("smash","Smash Padel") +
+    `<div class="acct"><span class="who"><strong>Let Padel</strong><small>Sans compte : créneaux publics</small></span></div>`;
+  $("acctFoot").textContent="Tes identifiants sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire.";
+  wire();
+}
+
+/* Fenêtre de connexion */
 const SHEETS={
-  "4padel":{title:"Se connecter à 4PADEL", key:true,
-    text:"Ton e-mail et ton mot de passe 4PADEL sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire."},
-  "smash":{title:"Se connecter à Smash Padel", key:false,
-    text:"Ton e-mail et ton mot de passe Smash Padel sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire."}};
+  "4padel":{title:"Connecter 4PADEL", key:true},
+  "smash":{title:"Connecter Smash Padel", key:false}};
 let PROVIDER="4padel";
 function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:""); }
 async function openSheet(p){
-  PROVIDER=p||"4padel"; const c=SHEETS[PROVIDER];
-  $("sheetTitle").textContent=c.title; $("sheetText").textContent=c.text;
-  $("keyBox").hidden=!c.key; $("manual").open=false;
-  $("cPass").value=""; $("tok").value=""; $("tokErr").textContent=""; setG("",""); $("gBtn").disabled=false; $("winBtn").disabled=false;
+  PROVIDER=SHEETS[p]?p:"4padel"; const c=SHEETS[PROVIDER];
+  $("sheetTitle").textContent=c.title;
+  $("sheetText").textContent="Ton e-mail et ton mot de passe sont chiffrés sur ce PC. La connexion se refait toute seule quand elle expire.";
+  $("keyBox").hidden=!c.key; $("manual").open=false; $("winBtn").parentElement.hidden=!!window.PADEL_CLOUD; $("winBtn").parentElement.previousElementSibling.hidden=!!window.PADEL_CLOUD;
+  $("cPass").value=""; $("tok").value=""; $("tokErr").textContent=""; setG(""); $("gBtn").disabled=false; $("winBtn").disabled=false;
+  $("cEmail").value=((S.accounts||{})[PROVIDER]||{}).email||"";
   $("sheet").showModal();
-  try{ const a=await (await fetch("/api/accounts")).json(); $("cEmail").value=(a[PROVIDER]||{}).email||""; }catch(e){}
+  if(!S.accounts){ try{ S.accounts=await (await fetch("/api/accounts")).json(); $("cEmail").value=(S.accounts[PROVIDER]||{}).email||""; }catch(e){} }
   ($("cEmail").value?$("cPass"):$("cEmail")).focus();
 }
 async function follow(){
   for(;;){
     await new Promise(r=>setTimeout(r,1000));
     const st=await (await fetch("/api/login/status")).json();
-    if(st.state==="done"){ setG(st.message,"ok"); setTimeout(()=>{ $("sheet").close(); load(); },900); return; }
+    if(st.state==="done"){ setG(st.message,"ok"); setTimeout(()=>{ $("sheet").close(); load(); refreshAccounts(); },900); return; }
     if(st.state==="error"){ setG(st.message,"bad"); $("gBtn").disabled=false; $("winBtn").disabled=false; return; }
     setG(st.message);
   }
 }
 $("sheetClose").onclick=()=>$("sheet").close();
-$("credForm").onsubmit = async (e)=>{
-  e.preventDefault();
-  $("gBtn").disabled=true; setG("Connexion en cours…");
+$("credForm").onsubmit=async e=>{
+  e.preventDefault(); $("gBtn").disabled=true; setG("Connexion en cours…");
   try{
     const r=await fetch("/api/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({provider:PROVIDER,email:$("cEmail").value,password:$("cPass").value})});
     $("cPass").value="";
     if(!r.ok){ const j=await r.json(); setG(j.error||"Échec.","bad"); $("gBtn").disabled=false; return; }
     await follow();
-  }catch(err){ setG("Le script local ne répond plus. Relance-le.","bad"); $("gBtn").disabled=false; }
+  }catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); $("gBtn").disabled=false; }
 };
-$("winBtn").onclick = async ()=>{
+$("winBtn").onclick=async()=>{
   $("winBtn").disabled=true; setG("Ouverture de Chrome…");
   try{ await fetch(`/api/login/start?p=${PROVIDER}&mode=window`,{method:"POST"}); await follow(); }
-  catch(err){ setG("Le script local ne répond plus. Relance-le.","bad"); $("winBtn").disabled=false; }
+  catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); $("winBtn").disabled=false; }
 };
-$("tokSave").onclick = async ()=>{
+$("tokSave").onclick=async()=>{
   const v=$("tok").value.trim().replace(/^Bearer\s+/i,"");
-  if(v.split(".").length!==3){ $("tokErr").textContent="Ce n’est pas une clé valide : elle doit commencer par « eyJ » et contenir deux points."; return; }
+  if(v.split(".").length!==3){ $("tokErr").textContent="Ce n’est pas une clé valide : elle commence par « eyJ » et contient deux points."; return; }
   try{
     const r=await fetch("/api/token",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:v})});
-    const j=await r.json();
-    if(!r.ok) throw new Error(j.error||"Enregistrement impossible.");
-    $("sheet").close(); load();
+    const j=await r.json(); if(!r.ok) throw new Error(j.error||"Enregistrement impossible.");
+    $("sheet").close(); load(); refreshAccounts();
   }catch(e){ $("tokErr").textContent=e.message; }
 };
 
-$("time").addEventListener("input",e=>{S.t=parseFloat(e.target.value); render();});
-$("nowBtn").onclick=()=>{
-  const n=new Date(); let t=n.getHours()+(n.getMinutes()>=30?.5:0);
-  S.t=Math.min(23.5,Math.max(8,t)); $("time").value=S.t;
-  if(S.offset!==0){S.offset=0; press($("days"),0); load();} else render();
-};
-document.querySelectorAll("#durs button").forEach((b,i)=>b.onclick=()=>{S.dur=+b.dataset.d; press($("durs"),i); load();});
-
-if(LIVE){
-  $("durBox").hidden=false;
-  $("lede").textContent="Créneaux libres en direct dans les clubs d’Orléans.";
-  $("foot").textContent="Données lues à l’instant sur les sites des clubs. Clique sur un horaire pour ouvrir la réservation du club avec la date, l’heure et la durée transmises quand la plateforme le permet.";
-} else {
-  $("foot").textContent="Horaires indicatifs relevés en octobre 2026. Les créneaux libres s’affichent sur la page de réservation de chaque club.";
+/* Onglets et réglages */
+function showTab(name){
+  $("scr-slots").hidden = name!=="slots"; $("scr-accounts").hidden = name!=="accounts";
+  $("tab-slots").setAttribute("aria-selected", name==="slots"); $("tab-accounts").setAttribute("aria-selected", name==="accounts");
+  if(name==="accounts") refreshAccounts();
+  window.scrollTo(0,0);
 }
-buildDays();
-$("nowBtn").click();
-if(LIVE) load(); else render();
+$("tab-slots").onclick=()=>showTab("slots");
+$("tab-accounts").onclick=()=>showTab("accounts");
+document.querySelectorAll("#themeSeg button").forEach(b=>b.onclick=()=>{PREFS.theme=b.dataset.v; savePrefs(); applyPrefs();});
+document.querySelectorAll("#accentSeg button").forEach(b=>b.onclick=()=>{PREFS.accent=b.dataset.v; savePrefs(); applyPrefs();});
+document.querySelectorAll("#defViewSeg button").forEach(b=>b.onclick=()=>{PREFS.view=b.dataset.v; savePrefs(); applyPrefs();});
+document.querySelectorAll("#views button").forEach(b=>b.onclick=()=>{S.view=b.dataset.v; press($("views"),x=>x===b); render();});
+document.querySelectorAll("#durs button").forEach(b=>b.onclick=()=>{S.dur=+b.dataset.d; press($("durs"),x=>x===b); load();});
+$("nowBtn").onclick=setNow;
+
+/* Démarrage */
+applyPrefs();
+buildDays(); buildHours();
+press($("views"),b=>b.dataset.v===S.view);
+if(!LIVE){
+  $("durRow").hidden=true; $("views").hidden=true; $("hoursLbl").textContent="À";
+  $("foot").textContent="Horaires d’ouverture indicatifs, relevés en octobre 2026. Les créneaux libres s’affichent dans l’outil installé sur ton PC.";
+} else {
+  $("foot").textContent="Prix par joueur. Smash : toucher un horaire ouvre directement la réservation de la piste. Let Padel et 4PADEL : le planning du club s’ouvre, choisis-y l’horaire.";
+}
+const n0=new Date(); S.t=Math.min(22,Math.max(8,n0.getHours())); syncHours();
+load();
 </script>
 </body>
 </html>
