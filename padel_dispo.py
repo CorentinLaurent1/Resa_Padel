@@ -704,33 +704,39 @@ def auto_login(provider, email, password, report=lambda m: None):
             pg = ctx.new_page()
             report("Ouverture de la page de connexion…")
             pg.goto(PROVIDERS[provider]["url"], wait_until="domcontentloaded", timeout=45000)
-            pg.wait_for_timeout(1500)
             try:
                 pg.evaluate(COOKIE_JS)
             except Exception:
                 pass
+            # On attend que le formulaire apparaisse, en vérifiant souvent et en
+            # cliquant « Se connecter » au besoin, plutôt que des pauses fixes.
             ok = False
-            for _ in range(4):
+            form_deadline = time.time() + 20
+            next_reveal = 0
+            while time.time() < form_deadline:
                 try:
                     ok = pg.evaluate(FIND_FORM_JS)
                 except Exception:
                     ok = False
                 if ok:
                     break
-                try:
-                    pg.evaluate(REVEAL_JS)
-                except Exception:
-                    pass
-                pg.wait_for_timeout(1500)
+                if time.time() >= next_reveal:
+                    try:
+                        pg.evaluate(REVEAL_JS)
+                    except Exception:
+                        pass
+                    next_reveal = time.time() + 1.2
+                pg.wait_for_timeout(150)
             if not ok:
                 raise RuntimeError("Formulaire de connexion introuvable sur le site du club.")
             report("Envoi de l’e-mail et du mot de passe…")
             pg.fill('[data-padel="email"]', email)
             pg.fill('[data-padel="pw"]', password)
             pg.press('[data-padel="pw"]', "Enter")
+            report("Vérification de tes identifiants…")
             deadline = time.time() + 40
             while time.time() < deadline:
-                pg.wait_for_timeout(1000)
+                pg.wait_for_timeout(250)
                 if found.get("refused"):
                     break
                 if _scan(ctx, provider, found):
@@ -1304,9 +1310,22 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   padding:24px;text-align:center;background:color-mix(in srgb,var(--card) 92%,transparent);
   backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);border-radius:inherit;animation:fade .2s ease}
 @keyframes fade{from{opacity:0}to{opacity:1}}
-.spinner-big{width:46px;height:46px;border:4px solid var(--hair);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+.ball-stage{position:relative;width:64px;height:76px;margin-bottom:4px}
+.ball{position:absolute;left:4px;top:0;animation:bounce .9s cubic-bezier(.5,.05,.5,.95) infinite}
+.ball-shadow{position:absolute;left:14px;bottom:2px;width:36px;height:9px;border-radius:50%;
+  background:rgba(0,0,0,.18);animation:shadow .9s cubic-bezier(.5,.05,.5,.95) infinite}
+@keyframes bounce{0%,100%{transform:translateY(0) scaleY(1)}12%{transform:translateY(2px) scaleY(.88)}50%{transform:translateY(22px) scaleY(1.02)}88%{transform:translateY(2px) scaleY(.88)}}
+@keyframes shadow{0%,100%{transform:scale(.7);opacity:.35}50%{transform:scale(1.1);opacity:.6}}
+.bar{width:150px;height:5px;border-radius:3px;background:var(--hair);overflow:hidden;margin:4px 0 2px}
+.bar span{display:block;height:100%;width:40%;border-radius:3px;background:var(--accent);animation:slide 1.1s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-120%)}60%{transform:translateX(260%)}100%{transform:translateX(260%)}}
 .overlay-msg{font-size:1.05rem;font-weight:600;margin:6px 0 0;min-height:1.4em}
+.overlay-msg .dots span{animation:blink 1.2s infinite both}
+.overlay-msg .dots span:nth-child(2){animation-delay:.2s}
+.overlay-msg .dots span:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,100%{opacity:.2}30%{opacity:1}}
 .overlay-sub{font-size:.85rem;color:var(--muted);margin:0}
+@media (prefers-reduced-motion: reduce){.ball,.ball-shadow,.bar span,.dots span{animation:none!important}}
 #overlayCancel{margin-top:10px}
 .skel{height:64px;border-radius:14px;background:linear-gradient(90deg,var(--card) 0%,var(--fill) 50%,var(--card) 100%);background-size:200% 100%;animation:sk 1.2s linear infinite;margin-top:12px}
 @keyframes sk{to{background-position:-200% 0}}
@@ -1431,8 +1450,15 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 <dialog id="sheet">
   <form class="sheet" id="credForm" autocomplete="on">
     <div class="overlay" id="overlay" hidden aria-live="polite">
-      <div class="spinner-big" aria-hidden="true"></div>
-      <p class="overlay-msg" id="overlayMsg">Connexion en cours…</p>
+      <div class="ball-stage" aria-hidden="true">
+        <svg class="ball" viewBox="0 0 64 64" width="56" height="56">
+          <circle cx="32" cy="32" r="29" fill="#D9EC2F" stroke="var(--accent)" stroke-width="3"/>
+          <path d="M14 14c12 10 12 26 0 36M50 14c-12 10-12 26 0 36" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        <div class="ball-shadow"></div>
+      </div>
+      <div class="bar" aria-hidden="true"><span></span></div>
+      <p class="overlay-msg" id="overlayMsg">Connexion en cours<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
       <p class="overlay-sub">Garde cette fenêtre ouverte.</p>
       <button class="btn-ghost" id="overlayCancel" type="button">Annuler</button>
     </div>
@@ -1718,8 +1744,14 @@ let PROVIDER="4padel";
 function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:(msg?" wait":"")); }
 function busy(btn, on){ if(!btn) return; btn.disabled=on; btn.classList.toggle("loading", on); }
 let LOGIN_ABORT=false;
-function showOverlay(msg){ LOGIN_ABORT=false; $("overlayMsg").textContent=msg||"Connexion en cours…"; $("overlay").hidden=false; }
-function overlay(msg){ if(!$("overlay").hidden && msg) $("overlayMsg").textContent=msg; }
+function showOverlay(msg){ LOGIN_ABORT=false; $("overlay").hidden=false; overlay(msg||"Connexion en cours…"); }
+const DOTS='<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+function overlay(msg){
+  if($("overlay").hidden || !msg) return;
+  const m=$("overlayMsg");
+  if(msg.endsWith("…")){ m.innerHTML=esc(msg.slice(0,-1))+DOTS; }   // « … » devient des points animés
+  else { m.textContent=msg; }
+}
 function hideOverlay(){ $("overlay").hidden=true; }
 let STEP_TIMER=null;
 function startSteps(club){
