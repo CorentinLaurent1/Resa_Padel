@@ -958,12 +958,15 @@ class Handler(BaseHTTPRequestHandler):
     def session(self):
         """Espace du visiteur, d'après son cookie (créé au besoin)."""
         self._new_cookie = None
+        self._renew_cookie = None
         raw = self.headers.get("Cookie", "")
         for part in raw.split(";"):
             k, _, v = part.strip().partition("=")
             if k == COOKIE and v:
                 try:
-                    return Session(v)
+                    sess = Session(v)
+                    self._renew_cookie = v   # on reposera le cookie pour repousser l'expiration
+                    return sess
                 except Exception:
                     break
         s = Session.new()
@@ -981,10 +984,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
         flags = "; HttpOnly; SameSite=Lax; Path=/" + ("; Secure" if self.https() else "")
+        value = getattr(self, "_new_cookie", None) or getattr(self, "_renew_cookie", None)
         if clear_cookie:
             self.send_header("Set-Cookie", f"{COOKIE}=; Max-Age=0" + flags)
-        elif getattr(self, "_new_cookie", None):
-            self.send_header("Set-Cookie", f"{COOKIE}={self._new_cookie}; Max-Age={180 * 86400}" + flags)
+        elif value:
+            # Expires + Max-Age : cookie persistant, reposé à chaque visite pour ne jamais expirer tant qu'on revient.
+            exp = (datetime.datetime.utcnow() + datetime.timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+            self.send_header("Set-Cookie", f"{COOKIE}={value}; Max-Age={180 * 86400}; Expires={exp}" + flags)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
