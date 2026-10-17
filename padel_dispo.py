@@ -31,14 +31,16 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 
 # --- Configuration des clubs (relevée dans les captures HAR) -----------------
 DOINSPORT_PADEL_ACTIVITY = "ce8c306e-224a-4f24-aa9d-6500580924dc"
-LETPADEL_CATEGORY = {"letpadel-fleury": "be10916d-f273-4f52-ad9b-da6379dca5c9"}
+# Deux centres Let Padel, confirmés par les captures (les pistes diffèrent).
 LETPADEL_CLUBS = {
-    "letpadel-pryve": "6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f",
-    "letpadel-fleury": "fc96f79e-ef94-4fa6-9b01-d494eccaa54f",
+    "letpadel-fleury": "6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f",   # CAR ONLINE, NVL, PM FILTRATION, VIRTUO
+    "letpadel-pryve": "fc96f79e-ef94-4fa6-9b01-d494eccaa54f",    # PISTE AUTOVISION, Piste, VIRTUO, NDA
 }
+# categoryId vue dans l'URL select-booking de chaque centre (vide si non connue).
+LETPADEL_CATEGORY = {"letpadel-pryve": "be10916d-f273-4f52-ad9b-da6379dca5c9"}
 LETPADEL_HOME = "https://letpadel.doinsport.club/home"
 LETPADEL_LOGIN_URL = "https://api-v3.doinsport.club/client_login_check"
-LETPADEL_LOGIN_CLUB = "/clubs/6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f"
+LETPADEL_LOGIN_CLUB = "/clubs/6a99f5f6-32bd-4fe3-ba15-8d22b1f58c1f"   # un seul compte Let Padel pour les deux centres
 LETPADEL_WHITE_LABEL = "/clubs/white-labels/9547ffa3-fb4e-4f84-944f-b73d64c05934"
 SMASH_BASE = "https://smashpadel.mymobileapp.fr"
 SMASH_SPORT_PADEL = "2"
@@ -1547,9 +1549,12 @@ function render(){
 }
 
 function slotTarget(r, s){
-  // Smash : réservation de la piste ouverte directement ; autres clubs : page de planning du club.
-  return s.book ? {tag:"button", attrs:`type="button" data-book='${esc(JSON.stringify(s.book))}'`}
-                : {tag:"a", attrs:`href="${esc(r.url)}" target="_blank" rel="noopener"`};
+  // Smash : réservation de la piste ouverte directement.
+  // Let Padel / 4PADEL : leur site n'accepte pas de lien vers un créneau précis,
+  // donc on ouvre le planning du bon club au bon jour et on rappelle l'heure à choisir.
+  if(s.book) return {tag:"button", attrs:`type="button" data-book='${esc(JSON.stringify(s.book))}'`};
+  const info=esc(JSON.stringify({url:r.url, name:r.c.name, time:s.time}));
+  return {tag:"button", attrs:`type="button" data-plan='${info}'`};
 }
 
 function renderByTime(rows){
@@ -1597,6 +1602,7 @@ function renderStatic(d, we, dayTxt){
 function wire(){
   const rb=document.getElementById("refreshBtn"); if(rb) rb.onclick=load;
   document.querySelectorAll("[data-book]").forEach(el=>el.onclick=()=>openBooking(el, JSON.parse(el.dataset.book)));
+  document.querySelectorAll("[data-plan]").forEach(el=>el.onclick=()=>openPlanning(JSON.parse(el.dataset.plan)));
   document.querySelectorAll("[data-connect]").forEach(el=>el.onclick=()=>openSheet(el.dataset.connect));
 }
 
@@ -1604,6 +1610,13 @@ function wire(){
 function toast(msg, bad){
   const t=$("toast"); t.textContent=msg; t.className="toast show"+(bad?" bad":"");
   clearTimeout(toast._t); toast._t=setTimeout(()=>t.className="toast", 6000);
+}
+function openPlanning(info){
+  const d=dateFor(S.offset);
+  const jour=S.offset===0?"aujourd’hui":S.offset===1?"demain":`le ${d.getDate()}/${d.getMonth()+1}`;
+  const win=window.open(info.url, "_blank", "noopener");
+  toast(`${info.name} ouvre son planning. Choisis ${jour} à ${info.time.replace(":","h")}.`);
+  if(!win) toast("Autorise les fenêtres surgissantes, puis retouche l’horaire.", true);
 }
 async function openBooking(el, book){
   if(el.classList.contains("busy")) return;
@@ -1677,6 +1690,14 @@ const ready = a => !!a && (a.connected || a.saved);   // identifiants enregistr�
 let PROVIDER="4padel";
 function setG(msg, cls){ const m=$("gMsg"); m.textContent=msg; m.className="status"+(cls?" "+cls:(msg?" wait":"")); }
 function busy(btn, on){ if(!btn) return; btn.disabled=on; btn.classList.toggle("loading", on); }
+let STEP_TIMER=null;
+function startSteps(club){
+  const steps=[`Connexion à ${club}…`, `Ouverture du site ${club}…`, "Vérification de tes identifiants…", "Encore quelques secondes…"];
+  let i=0; setG(steps[0]);
+  clearInterval(STEP_TIMER);
+  STEP_TIMER=setInterval(()=>{ i=Math.min(i+1,steps.length-1); if($("gMsg").className.includes("wait")) setG(steps[i]); }, 2500);
+}
+function stopSteps(){ clearInterval(STEP_TIMER); STEP_TIMER=null; }
 async function openSheet(p){
   PROVIDER=SHEETS[p]?p:"4padel"; const c=SHEETS[PROVIDER];
   $("sheetTitle").textContent=c.title;
@@ -1707,26 +1728,26 @@ async function follow(){
     await new Promise(r=>setTimeout(r,1000));
     let st;
     try{ st=await (await fetch("/api/login/status")).json(); fails=0; }
-    catch(e){ if(++fails>=8){ setG("Connexion perdue avec le serveur. Réessaie.","bad"); stop(); return; } continue; }
-    if(st.state==="done"){ setG(st.message,"ok"); busy($("gBtn"), false); busy($("winBtn"), false); setTimeout(afterLogin,900); return; }
-    if(st.state==="error"){ setG(st.message,"bad"); stop(); return; }
-    setG(st.message||"Connexion en cours…");
+    catch(e){ if(++fails>=8){ stopSteps(); setG("Connexion perdue avec le serveur. Réessaie.","bad"); stop(); return; } continue; }
+    if(st.state==="done"){ stopSteps(); setG(st.message,"ok"); busy($("gBtn"), false); busy($("winBtn"), false); setTimeout(afterLogin,900); return; }
+    if(st.state==="error"){ stopSteps(); setG(st.message,"bad"); stop(); return; }
+    if(st.message) setG(st.message);
   }
-  setG("La connexion prend trop de temps. Réessaie.","bad"); stop();
+  stopSteps(); setG("La connexion prend trop de temps. Réessaie.","bad"); stop();
 }
 $("sheetClose").onclick=()=>$("sheet").close();
 $("credForm").onsubmit=async e=>{
-  e.preventDefault(); busy($("gBtn"), true); setG("Connexion en cours…");
+  e.preventDefault(); busy($("gBtn"), true); startSteps((SHEETS[PROVIDER]||{}).club||"ton club");
   try{
     const r=await fetch("/api/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({provider:PROVIDER,email:$("cEmail").value,password:$("cPass").value,remember:$("cRemember").checked})});
     $("cPass").value="";
-    if(!r.ok){ const j=await r.json(); setG(j.error||"Échec.","bad"); busy($("gBtn"), false); return; }
+    if(!r.ok){ const j=await r.json(); stopSteps(); setG(j.error||"Échec.","bad"); busy($("gBtn"), false); return; }
     await follow();
-  }catch(err){ setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); busy($("gBtn"), false); }
+  }catch(err){ stopSteps(); setG("Le serveur ne répond pas. Réessaie dans un instant.","bad"); busy($("gBtn"), false); }
 };
 $("winBtn").onclick=async()=>{
-  busy($("winBtn"), true); setG("Ouverture de Chrome…");
+  busy($("winBtn"), true); startSteps((SHEETS[PROVIDER]||{}).club||"ton club");
   try{ await fetch("/api/login/window",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:PROVIDER})}); await follow(); }
   catch(err){ setG("L’outil sur ton PC ne répond pas. Relance-le.","bad"); busy($("winBtn"), false); }
 };
