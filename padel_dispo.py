@@ -1123,6 +1123,8 @@ PAGE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#F2F2F7">
 <title>Padel à Orléans</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlBhZGVsIE9ybMOpYW5zIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iYmciIHgxPSIwIiB5MT0iMCIgeDI9IjAiIHkyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjMkU5Q0ZGIi8+CiAgICAgIDxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzAwNjJFNiIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICA8L2RlZnM+CiAgPHJlY3Qgd2lkdGg9IjUxMiIgaGVpZ2h0PSI1MTIiIHJ4PSIxMTQiIGZpbGw9InVybCgjYmcpIi8+CiAgPCEtLSByYXF1ZXR0ZSA6IHRldGUgb3ZhbGUgKyBwb250ICsgbWFuY2hlLCBlbiBibGFuYyAtLT4KICA8ZyBmaWxsPSIjZmZmIj4KICAgIDwhLS0gdGV0ZSBwbGVpbmUgYXZlYyB0cm91cyBham91csOpcyAtLT4KICAgIDxwYXRoIGQ9Ik0yNTYgOTJjLTc5IDAtMTMyIDU1LTEzMiAxMzIgMCA2MiA0MCAxMDQgOTYgMTE2djI0YTM2IDM2IDAgMSAwIDcyIDB2LTI0YzU2LTEyIDk2LTU0IDk2LTExNiAwLTc3LTUzLTEzMi0xMzItMTMyegogICAgICAgICAgICAgTTE5NiAxOTZhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTI1NiAxODJhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTMxNiAxOTZhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTIyNiAyNThhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTI4NiAyNThhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0eiIgZmlsbC1ydWxlPSJldmVub2RkIi8+CiAgPC9nPgogIDwhLS0gYmFsbGUgLS0+CiAgPGNpcmNsZSBjeD0iMzU2IiBjeT0iMzU2IiByPSI0MCIgZmlsbD0iI0Q5RUMyRiIgc3Ryb2tlPSIjMDA2MkU2IiBzdHJva2Utd2lkdGg9IjYiLz4KICA8cGF0aCBkPSJNMzMyIDMzMGMxNCAxNCAxNCAzOCAwIDUyTTM4MCAzMzBjLTE0IDE0LTE0IDM4IDAgNTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzAwNjJFNiIgc3Ryb2tlLXdpZHRoPSI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KPC9zdmc+">
+<link rel="apple-touch-icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlBhZGVsIE9ybMOpYW5zIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iYmciIHgxPSIwIiB5MT0iMCIgeDI9IjAiIHkyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjMkU5Q0ZGIi8+CiAgICAgIDxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzAwNjJFNiIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICA8L2RlZnM+CiAgPHJlY3Qgd2lkdGg9IjUxMiIgaGVpZ2h0PSI1MTIiIHJ4PSIxMTQiIGZpbGw9InVybCgjYmcpIi8+CiAgPCEtLSByYXF1ZXR0ZSA6IHRldGUgb3ZhbGUgKyBwb250ICsgbWFuY2hlLCBlbiBibGFuYyAtLT4KICA8ZyBmaWxsPSIjZmZmIj4KICAgIDwhLS0gdGV0ZSBwbGVpbmUgYXZlYyB0cm91cyBham91csOpcyAtLT4KICAgIDxwYXRoIGQ9Ik0yNTYgOTJjLTc5IDAtMTMyIDU1LTEzMiAxMzIgMCA2MiA0MCAxMDQgOTYgMTE2djI0YTM2IDM2IDAgMSAwIDcyIDB2LTI0YzU2LTEyIDk2LTU0IDk2LTExNiAwLTc3LTUzLTEzMi0xMzItMTMyegogICAgICAgICAgICAgTTE5NiAxOTZhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTI1NiAxODJhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTMxNiAxOTZhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTIyNiAyNThhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0egogICAgICAgICAgICAgTTI4NiAyNThhMjIgMjIgMCAxIDEgMCA0NCAyMiAyMiAwIDAgMSAwLTQ0eiIgZmlsbC1ydWxlPSJldmVub2RkIi8+CiAgPC9nPgogIDwhLS0gYmFsbGUgLS0+CiAgPGNpcmNsZSBjeD0iMzU2IiBjeT0iMzU2IiByPSI0MCIgZmlsbD0iI0Q5RUMyRiIgc3Ryb2tlPSIjMDA2MkU2IiBzdHJva2Utd2lkdGg9IjYiLz4KICA8cGF0aCBkPSJNMzMyIDMzMGMxNCAxNCAxNCAzOCAwIDUyTTM4MCAzMzBjLTE0IDE0LTE0IDM4IDAgNTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzAwNjJFNiIgc3Ryb2tlLXdpZHRoPSI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KPC9zdmc+">
 <style>
 :root{
   --bg:#F2F2F7; --card:#FFFFFF; --ink:#000000; --muted:#6C6C70; --hair:#E5E5EA; --fill:#E9E9EE; --seg:#FFFFFF;
@@ -1141,6 +1143,11 @@ PAGE = r'''<!DOCTYPE html>
 :root[data-accent="orange"]{--accent:var(--orange)}
 *,*::before,*::after{box-sizing:inherit}
 [hidden]{display:none!important}
+.logo-badge{width:1.15em;height:1.15em;flex:0 0 auto;border-radius:24%;vertical-align:-.22em;margin-right:.4em}
+.brandline{display:flex;align-items:center;gap:0}
+.brandline .logo-badge{width:22px;height:22px;margin-right:9px;vertical-align:baseline}
+.brand{display:flex;align-items:center;gap:9px}
+.brand .logo-badge{width:26px;height:26px;margin:0}
 html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
 body{margin:0;background:var(--bg);color:var(--ink);min-height:100%;
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","Segoe UI",Roboto,Arial,sans-serif;
@@ -1345,7 +1352,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 <body>
 <main class="screen" id="scr-onboarding" hidden>
   <div class="onb">
-    <p class="kicker">Padel à Orléans</p>
+    <p class="kicker brandline"><svg class="logo-badge" viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="114" fill="var(--accent)"/><g fill="#fff"><path d="M256 92c-79 0-132 55-132 132 0 62 40 104 96 116v24a36 36 0 1 0 72 0v-24c56-12 96-54 96-116 0-77-53-132-132-132zM196 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM256 182a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM316 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM226 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM286 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44z" fill-rule="evenodd"/></g><circle cx="356" cy="356" r="40" fill="#D9EC2F" stroke="var(--accent)" stroke-width="6"/></svg><span>Padel à Orléans</span></p>
     <h1>Connecte tes clubs</h1>
     <p class="lead">Connecte tes comptes 4PADEL, Let Padel et Smash Padel pour voir leurs créneaux libres. Pas encore de compte dans un club ? Crée-le sur son site, c’est gratuit.</p>
     <section class="group" id="onbList"></section>
@@ -1357,7 +1364,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 
 <main class="screen" id="scr-slots">
   <header class="hdr">
-    <p class="kicker">Padel à Orléans</p>
+    <p class="kicker brandline"><svg class="logo-badge" viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="114" fill="var(--accent)"/><g fill="#fff"><path d="M256 92c-79 0-132 55-132 132 0 62 40 104 96 116v24a36 36 0 1 0 72 0v-24c56-12 96-54 96-116 0-77-53-132-132-132zM196 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM256 182a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM316 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM226 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM286 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44z" fill-rule="evenodd"/></g><circle cx="356" cy="356" r="40" fill="#D9EC2F" stroke="var(--accent)" stroke-width="6"/></svg><span>Padel à Orléans</span></p>
     <div class="titlerow"><h1>Créneaux</h1><button class="pill" id="nowBtn" type="button">Maintenant</button></div>
   </header>
   <section class="filters" aria-label="Filtres">
@@ -1387,7 +1394,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 </main>
 
 <main class="screen" id="scr-accounts" hidden>
-  <p class="kicker">Padel à Orléans</p>
+  <p class="kicker brandline"><svg class="logo-badge" viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="114" fill="var(--accent)"/><g fill="#fff"><path d="M256 92c-79 0-132 55-132 132 0 62 40 104 96 116v24a36 36 0 1 0 72 0v-24c56-12 96-54 96-116 0-77-53-132-132-132zM196 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM256 182a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM316 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM226 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM286 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44z" fill-rule="evenodd"/></g><circle cx="356" cy="356" r="40" fill="#D9EC2F" stroke="var(--accent)" stroke-width="6"/></svg><span>Padel à Orléans</span></p>
   <div class="titlerow"><h1>Comptes</h1></div>
   <section class="group" id="acctList"></section>
   <p class="foot" id="acctFoot"></p>
@@ -1407,7 +1414,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 </main>
 
 <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sections">
-  <span class="brand">Padel à Orléans</span>
+  <span class="brand"><svg class="logo-badge" viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="114" fill="var(--accent)"/><g fill="#fff"><path d="M256 92c-79 0-132 55-132 132 0 62 40 104 96 116v24a36 36 0 1 0 72 0v-24c56-12 96-54 96-116 0-77-53-132-132-132zM196 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM256 182a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM316 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM226 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM286 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44z" fill-rule="evenodd"/></g><circle cx="356" cy="356" r="40" fill="#D9EC2F" stroke="var(--accent)" stroke-width="6"/></svg><span>Padel à Orléans</span></span>
   <button class="tab" role="tab" id="tab-slots" aria-selected="true" type="button">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/><circle cx="8.5" cy="14.5" r="1" fill="currentColor"/><circle cx="12" cy="14.5" r="1" fill="currentColor"/></svg>
     Créneaux</button>
