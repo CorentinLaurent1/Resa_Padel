@@ -519,6 +519,164 @@ def purge_old(days=180):
         if old:
             _flush()
 
+# =============================================================================
+#  Comptes utilisateurs (zéro connaissance)
+# =============================================================================
+# Un visiteur peut créer un COMPTE pour retrouver ses connexions aux clubs sur
+# n'importe quel appareil. Principe « zéro connaissance » :
+#   - La clé qui chiffre les connexions aux clubs est dérivée du mot de passe du
+#     compte (PBKDF2, 210 000 tours). Elle n'est jamais écrite sur le serveur.
+#   - Le serveur ne garde que : une empreinte de l'e-mail (pour retrouver le
+#     compte), un "verifier" pour contrôler le mot de passe sans le connaître,
+#     et les connexions aux clubs chiffrées avec cette clé.
+#   - Conséquence CNIL : l'exploitant ne peut PAS lire les mots de passe des
+#     clubs. Revers : mot de passe du compte oublié => données irrécupérables
+#     (l'utilisateur recrée un compte et se reconnecte aux clubs).
+PBKDF2_ROUNDS = 210_000
+ACCOUNT_SALT = b"padel-orleans-account-v1"      # sel fixe : l'e-mail n'est pas stocké en clair
+
+
+def _email_id(email):
+    """Identifiant de rangement d'un compte : empreinte de l'e-mail normalisé (jamais l'e-mail en clair)."""
+    norm = email.strip().lower().encode()
+    return "acct_" + hashlib.sha256(ACCOUNT_SALT + norm).hexdigest()
+
+
+def _account_keys(email, password):
+    """Dérive, du mot de passe, la clé de chiffrement et un vérificateur. Lent par conception."""
+    norm_mail = email.strip().lower().encode()
+    salt = hashlib.sha256(ACCOUNT_SALT + norm_mail).digest()      # sel propre au compte
+    master = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ROUNDS)
+    enc = hashlib.sha256(b"padel-enc" + master).digest()
+    mac = hashlib.sha256(b"padel-mac" + master).digest()
+    verifier = hashlib.sha256(b"padel-verify" + master).hexdigest()   # prouve le mot de passe sans le révéler
+    return enc, mac, verifier
+
+
+class Account:
+    """Comme Session, mais la clé vient du mot de passe du compte, pas du cookie."""
+
+    def __init__(self, email, enc, mac, verifier):
+        self.id = _email_id(email)
+        self._enc, self._mac, self.verifier = enc, mac, verifier
+
+    @classmethod
+    def derive(cls, email, password):
+        enc, mac, verifier = _account_keys(email, password)
+        return cls(email, enc, mac, verifier)
+
+    def exists(self):
+        with STORE_LOCK:
+            return self.id in _store()
+
+    def verifier_ok(self):
+        """True si le mot de passe fourni correspond au compte stocké."""
+        if not self.verifier:
+            return False
+        with STORE_LOCK:
+            rec = _store().get(self.id)
+        return bool(rec) and hmac.compare_digest(rec.get("verifier", "") or "", self.verifier)
+
+    def create(self):
+        with STORE_LOCK:
+            st = _store()
+            if self.id in st:
+                return False
+            st[self.id] = {"verifier": self.verifier,
+                           "data": seal(self._enc, self._mac, {}),
+                           "seen": int(time.time()), "account": True}
+            _flush()
+            return True
+
+    def load(self):
+        with STORE_LOCK:
+            blob = _store().get(self.id, {}).get("data")
+        if not blob:
+            return {}
+        try:
+            return unseal(self._enc, self._mac, blob)
+        except Exception:
+            return {}
+
+    def update(self, fn):
+        with STORE_LOCK:
+            st = _store()
+            rec = st.get(self.id, {})
+            try:
+                data = unseal(self._enc, self._mac, rec["data"]) if rec.get("data") else {}
+            except Exception:
+                data = {}
+            fn(data)
+            rec["data"] = seal(self._enc, self._mac, data)
+            rec["seen"] = int(time.time())
+            rec["account"] = True
+            if self.verifier:                 # ne jamais écraser le verifier par None (jeton cookie)
+                rec["verifier"] = self.verifier
+            st[self.id] = rec
+            _flush()
+            return data
+
+    def forget(self):
+        with STORE_LOCK:
+            if _store().pop(self.id, None) is not None:
+                _flush()
+        LOGINS.pop(self.id, None)
+
+
+# Jeton de session déposé en cookie après connexion au compte : il porte la clé
+# dérivée (chiffrée pour le serveur), pas le mot de passe. Il vit dans le
+# navigateur et permet de rester connecté sans retaper le mot de passe.
+ACCOUNT_COOKIE = "padel_acct"
+_SERVER_SECRET = None
+
+
+def server_secret():
+    """Secret stable du serveur, pour sceller les jetons de session compte."""
+    global _SERVER_SECRET
+    if _SERVER_SECRET is None:
+        path = os.path.join(DATA_DIR, ".server_secret")
+        try:
+            with open(path, "rb") as f:
+                _SERVER_SECRET = f.read()
+            if len(_SERVER_SECRET) < 32:
+                raise ValueError
+        except Exception:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            _SERVER_SECRET = secrets.token_bytes(32)
+            with open(path, "wb") as f:
+                f.write(_SERVER_SECRET)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+    return _SERVER_SECRET
+
+
+def make_account_token(email, enc, mac):
+    """Jeton opaque {id, enc, mac} scellé avec le secret serveur, déposé en cookie."""
+    payload = {"id": _email_id(email),
+               "enc": base64.b64encode(enc).decode(),
+               "mac": base64.b64encode(mac).decode()}
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac.new(server_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
+    return body + "." + sig
+
+
+def read_account_token(token):
+    """Rend un Account depuis le jeton cookie, ou None s'il est absent/invalide."""
+    try:
+        body, sig = token.split(".", 1)
+        good = hmac.new(server_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, good):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        enc = base64.b64decode(payload["enc"]); mac = base64.b64decode(payload["mac"])
+        a = Account.__new__(Account)
+        a.id = payload["id"]; a._enc = enc; a._mac = mac; a.verifier = None
+        return a
+    except Exception:
+        return None
+
 
 # --- Sessions des clubs dans l'espace du visiteur ------------------------------
 def session_state(data, provider):
@@ -937,8 +1095,10 @@ def all_slots(sess, date, duration):
     return {"date": date, "duration": duration, "clubs": clubs}
 
 
-def accounts(data):
+def accounts(data, is_account=False):
     out = {}
+    if is_account:
+        out["account"] = {"email": data.get("account_email", "")}
     for p in PROVIDER_IDS:
         ok, exp = session_state(data, p)
         out[p] = {"email": (data.get("emails") or {}).get(p, ""), "connected": ok,
@@ -955,20 +1115,36 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # --- outils
+    def cookies(self):
+        out = {}
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k and v:
+                out[k] = v
+        return out
+
     def session(self):
-        """Espace du visiteur, d'après son cookie (créé au besoin)."""
+        """Espace de données : compte connecté si présent, sinon espace par navigateur."""
         self._new_cookie = None
         self._renew_cookie = None
-        raw = self.headers.get("Cookie", "")
-        for part in raw.split(";"):
-            k, _, v = part.strip().partition("=")
-            if k == COOKIE and v:
-                try:
-                    sess = Session(v)
-                    self._renew_cookie = v   # on reposera le cookie pour repousser l'expiration
-                    return sess
-                except Exception:
-                    break
+        self._new_acct = None
+        self._renew_acct = None
+        self._logout_acct = False
+        ck = self.cookies()
+        tok = ck.get(ACCOUNT_COOKIE)
+        if tok:
+            acct = read_account_token(tok)
+            if acct:
+                self._renew_acct = tok      # on repose le cookie de compte à chaque visite
+                return acct
+        v = ck.get(COOKIE)
+        if v:
+            try:
+                sess = Session(v)
+                self._renew_cookie = v
+                return sess
+            except Exception:
+                pass
         s = Session.new()
         self._new_cookie = s.secret
         return s
@@ -998,13 +1174,24 @@ class Handler(BaseHTTPRequestHandler):
                 "script-src 'self' 'unsafe-inline'; "
                 "connect-src 'self'")
         flags = "; HttpOnly; SameSite=Lax; Path=/" + ("; Secure" if self.https() else "")
-        value = getattr(self, "_new_cookie", None) or getattr(self, "_renew_cookie", None)
-        if clear_cookie:
-            self.send_header("Set-Cookie", f"{COOKIE}=; Max-Age=0" + flags)
-        elif value:
-            # Expires + Max-Age : cookie persistant, reposé à chaque visite pour ne jamais expirer tant qu'on revient.
-            exp = (datetime.datetime.utcnow() + datetime.timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
-            self.send_header("Set-Cookie", f"{COOKIE}={value}; Max-Age={180 * 86400}; Expires={exp}" + flags)
+        exp = (datetime.datetime.utcnow() + datetime.timedelta(days=180)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        cookies_out = []
+        if clear_cookie:   # déconnexion : on efface les deux cookies
+            cookies_out.append(f"{COOKIE}=; Max-Age=0" + flags)
+            cookies_out.append(f"{ACCOUNT_COOKIE}=; Max-Age=0" + flags)
+        else:
+            # cookie de compte : posé à la connexion, reposé à chaque visite
+            acct_val = getattr(self, "_new_acct", None) or getattr(self, "_renew_acct", None)
+            if acct_val:
+                cookies_out.append(f"{ACCOUNT_COOKIE}={acct_val}; Max-Age={180 * 86400}; Expires={exp}" + flags)
+            if getattr(self, "_logout_acct", False):
+                cookies_out.append(f"{ACCOUNT_COOKIE}=; Max-Age=0" + flags)
+            # cookie navigateur anonyme (quand pas de compte)
+            value = getattr(self, "_new_cookie", None) or getattr(self, "_renew_cookie", None)
+            if value:
+                cookies_out.append(f"{COOKIE}={value}; Max-Age={180 * 86400}; Expires={exp}" + flags)
+        for c in cookies_out:
+            self.send_header("Set-Cookie", c)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1063,7 +1250,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/login/status":
             return self.send(200, LOGINS.get(sess.id, {"state": "idle", "message": ""}))
         if u.path == "/api/accounts":
-            return self.send(200, accounts(sess.load()))
+            return self.send(200, accounts(sess.load(), isinstance(sess, Account)))
         self.send(404, {"error": "Introuvable."})
 
     # --- POST
@@ -1078,6 +1265,33 @@ class Handler(BaseHTTPRequestHandler):
             j = self.body()
         except Exception:
             return self.send(400, {"error": "Requête invalide."})
+
+        # --- Compte utilisateur (zéro connaissance) ---
+        if path in ("/api/account/signup", "/api/account/login"):
+            email = str(j.get("email", "")).strip()
+            password = str(j.get("password", ""))
+            if "@" not in email or len(email) > 200 or len(password) < 6 or len(password) > 200:
+                return self.send(400, {"error": "E-mail invalide ou mot de passe trop court (6 caractères minimum)."})
+            if not (rate_ok("acct:" + _email_id(email)) and rate_ok("ip:" + self.client_ip(), limit=20)):
+                return self.send(429, {"error": "Trop de tentatives. Réessaie dans quelques minutes."})
+            acct = Account.derive(email, password)
+            if path.endswith("signup"):
+                if not acct.create():
+                    return self.send(409, {"error": "Un compte existe déjà avec cet e-mail. Connecte-toi."})
+                acct.update(lambda d: d.__setitem__("account_email", email))
+            else:
+                if not acct.exists():
+                    return self.send(404, {"error": "Aucun compte avec cet e-mail. Crée un compte."})
+                if not acct.verifier_ok():
+                    return self.send(403, {"error": "Mot de passe incorrect."})
+            # Pose le cookie de compte (porte la clé dérivée, jamais le mot de passe).
+            self._new_acct = make_account_token(email, acct._enc, acct._mac)
+            return self.send(200, {"ok": True})
+
+        if path == "/api/account/logout":
+            # Se déconnecter du compte : on efface juste le cookie, les données restent chiffrées sur le serveur.
+            self._logout_acct = True
+            return self.send(200, {"ok": True})
 
         if path == "/api/credentials":
             provider = j.get("provider")
@@ -1404,7 +1618,8 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
     <section class="group" id="onbList"></section>
     <button class="btn-wide dim" id="onbGo" type="button" disabled>Voir les créneaux</button>
     <p class="foot" id="onbFoot">Encore 3 comptes à connecter.</p>
-    <p class="foot">Tes connexions sont chiffrées avec une clé gardée dans ton navigateur. Tu peux tout supprimer depuis l’onglet Comptes.</p>
+    <section class="group" id="onbAccount" style="margin-top:18px"></section>
+    <p class="foot">Tes connexions sont chiffrées. Avec un compte, tu les retrouves sur tous tes appareils ; sans compte, elles restent sur cet appareil.</p>
   </div>
 </main>
 
@@ -1442,6 +1657,9 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 <main class="screen" id="scr-accounts" hidden>
   <p class="kicker brandline"><svg class="logo-badge" viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="114" fill="var(--accent)"/><g fill="#fff"><path d="M256 92c-79 0-132 55-132 132 0 62 40 104 96 116v24a36 36 0 1 0 72 0v-24c56-12 96-54 96-116 0-77-53-132-132-132zM196 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM256 182a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM316 196a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM226 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44zM286 258a22 22 0 1 1 0 44 22 22 0 0 1 0-44z" fill-rule="evenodd"/></g><circle cx="356" cy="356" r="40" fill="#D9EC2F" stroke="var(--accent)" stroke-width="6"/></svg><span>Padel à Orléans</span></p>
   <div class="titlerow"><h1>Comptes</h1></div>
+  <h3 class="gtitle">Mon compte Padel Orléans</h3>
+  <section class="group" id="myAccount"></section>
+  <h3 class="gtitle">Mes clubs</h3>
   <section class="group" id="acctList"></section>
   <p class="foot" id="acctFoot"></p>
   <button class="danger" id="forgetBtn" type="button">Supprimer mes données</button>
@@ -1469,6 +1687,18 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
     Comptes</button>
 </nav>
 
+<dialog id="acctSheet">
+  <form class="sheet" id="acctForm" autocomplete="on">
+    <h2 id="acctTitle">Créer mon compte</h2>
+    <p class="sub" id="acctText">Garde tes connexions aux clubs et retrouve-les sur tous tes appareils. Ton mot de passe reste connu de toi seul : nous ne pouvons pas le lire.</p>
+    <label class="field"><span>E-mail</span><input type="email" id="aEmail" autocomplete="username" required></label>
+    <label class="field"><span>Mot de passe</span><input type="password" id="aPass" autocomplete="current-password" required></label>
+    <p class="status" id="aMsg" aria-live="polite"></p>
+    <button class="btn-wide" id="aGo" type="submit">Créer mon compte</button>
+    <p class="sub" id="aSwitch" style="text-align:center;margin-top:14px"></p>
+    <div class="rowend"><button class="btn-ghost" id="aClose" type="button">Fermer</button></div>
+  </form>
+</dialog>
 <dialog id="sheet">
   <form class="sheet" id="credForm" autocomplete="on">
     <div class="overlay" id="overlay" hidden aria-live="polite">
@@ -1506,6 +1736,7 @@ const LIVE = window.PADEL_LIVE === true;
 // Démarre la requête des comptes immédiatement, sans attendre la fin du script,
 // pour qu'elle voyage en parallèle (chaîne critique plus courte, cf. Lighthouse).
 const ACCOUNTS_READY = LIVE ? fetch("/api/accounts").then(r=>r.json()).catch(()=>({})) : Promise.resolve({});
+ACCOUNTS_READY.then(a=>{ if(a && a.account) ACCOUNT=a.account; });
 const H = (wk, we) => ({wk, we});
 const CLUBS = [
   {id:"4padel", name:"4PADEL Orléans", city:"Fleury-les-Aubrais", courts:"6 pistes indoor", account:true,
@@ -1730,6 +1961,17 @@ async function checkGate(){
   const a=S.accounts||{};
   const missing=ACCOUNTS.filter(x=>x.required && !ready(a[x.id]));
   $("onbList").innerHTML=ACCOUNTS.map(x=>acctRow(x, a[x.id]||{}, true)).join("");
+  const ob=$("onbAccount");
+  if(ob){
+    if(ACCOUNT && ACCOUNT.email){
+      ob.innerHTML=`<div class="acct"><span class="who"><strong>Compte connecté</strong><small>${esc(ACCOUNT.email)}</small></span></div>`;
+    } else {
+      ob.innerHTML=`<div class="acct"><span class="who"><strong>Garde tes clubs</strong><small>Crée un compte pour les retrouver partout.</small></span></div>
+        <div class="acct"><button class="btn-ghost" type="button" id="onbSignup">Créer un compte</button><button class="btn-ghost" type="button" id="onbLogin">Se connecter</button></div>`;
+      $("onbSignup").onclick=()=>openAccountSheet("signup");
+      $("onbLogin").onclick=()=>openAccountSheet("login");
+    }
+  }
   $("onbGo").disabled=!!missing.length; $("onbGo").classList.toggle("dim", !!missing.length);
   $("onbFoot").textContent = missing.length
     ? (missing.length===1 ? `Plus que ${missing[0].name} à connecter.` : `Encore ${missing.length} comptes à connecter.`)
@@ -1742,7 +1984,50 @@ async function gate(){
   if(ok){ showTab("slots"); load(); }
   else showTab("onboarding");
 }
+let ACCOUNT=null;   // {email} si connecté à un compte, sinon null
+async function renderMyAccount(){
+  const box=$("myAccount"); if(!box) return;
+  if(!LIVE){ box.innerHTML='<div class="acct"><span class="who"><strong>Compte</strong><small>Disponible sur le site en ligne.</small></span></div>'; return; }
+  if(ACCOUNT && ACCOUNT.email){
+    box.innerHTML=`<div class="acct"><span class="who"><strong>Connecté</strong><small>${esc(ACCOUNT.email)}</small></span><button class="btn-ghost" id="logoutBtn" type="button">Déconnexion</button></div>`;
+    $("logoutBtn").onclick=async()=>{
+      try{ await fetch("/api/account/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }catch(e){}
+      ACCOUNT=null; S.accounts=null; location.reload();
+    };
+  } else {
+    box.innerHTML=`<div class="acct"><span class="who"><strong>Pas de compte</strong><small>Crée un compte pour retrouver tes clubs sur tous tes appareils.</small></span></div>
+      <div class="acct"><button class="btn-ghost" id="signupBtn" type="button">Créer un compte</button><button class="btn-ghost" id="loginBtn" type="button">Se connecter</button></div>`;
+    $("signupBtn").onclick=()=>openAccountSheet("signup");
+    $("loginBtn").onclick=()=>openAccountSheet("login");
+  }
+}
+const ACCT_SHEET={signup:{title:"Créer mon compte",btn:"Créer mon compte",path:"/api/account/signup",
+    switch:'Déjà un compte ? <a href="#" id="toLogin">Se connecter</a>'},
+  login:{title:"Se connecter",btn:"Se connecter",path:"/api/account/login",
+    switch:'Pas encore de compte ? <a href="#" id="toSignup">En créer un</a>'}};
+let ACCT_MODE="signup";
+function setA(msg,cls){ const m=$("aMsg"); m.textContent=msg||""; m.className="status"+(cls?" "+cls:(msg?" wait":"")); }
+function openAccountSheet(mode){
+  ACCT_MODE=mode; const c=ACCT_SHEET[mode];
+  $("acctTitle").textContent=c.title; $("aGo").textContent=c.btn;
+  $("acctText").textContent="Garde tes connexions aux clubs et retrouve-les sur tous tes appareils. Ton mot de passe reste connu de toi seul : nous ne pouvons pas le lire.";
+  $("aSwitch").innerHTML=c.switch; $("aPass").value=""; setA(""); $("aGo").disabled=false;
+  const t=$("toLogin")||$("toSignup"); if(t) t.onclick=(e)=>{e.preventDefault(); openAccountSheet(mode==="signup"?"login":"signup");};
+  $("acctSheet").showModal(); $("aEmail").focus();
+}
+$("aClose").onclick=()=>$("acctSheet").close();
+$("acctForm").onsubmit=async e=>{
+  e.preventDefault(); $("aGo").disabled=true; setA(ACCT_MODE==="signup"?"Création…":"Connexion…");
+  try{
+    const r=await fetch(ACCT_SHEET[ACCT_MODE].path,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({email:$("aEmail").value,password:$("aPass").value})});
+    const j=await r.json(); $("aPass").value="";
+    if(!r.ok){ setA(j.error||"Échec.","bad"); $("aGo").disabled=false; return; }
+    setA("C\u2019est bon !","ok"); setTimeout(()=>location.reload(),600);
+  }catch(err){ setA("Le serveur ne répond pas.","bad"); $("aGo").disabled=false; }
+};
 async function refreshAccounts(){
+  await renderMyAccount();
   if(!LIVE){
     $("acctList").innerHTML=`<div class="acct"><span class="who"><strong>Comptes des clubs</strong><small>Ils se gèrent dans l’outil installé sur ton PC.</small></span></div>`;
     $("acctFoot").textContent="Cette page en ligne affiche les horaires d’ouverture. Les créneaux libres s’affichent dans l’outil lancé avec lancer_padel.bat.";
