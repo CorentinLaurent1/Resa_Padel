@@ -14,7 +14,7 @@ Options : PADEL_ACCESS (mot de passe d'accès au site, facultatif),
 Dépendances : Python 3.8+ et playwright (py -m pip install playwright),
 plus Chrome/Edge sur ton PC, ou « playwright install chromium » sur un serveur.
 """
-import base64, collections, datetime, hashlib, hmac, json, os, re, secrets, shutil, subprocess, sys, threading, time
+import base64, collections, contextlib, datetime, hashlib, hmac, json, os, re, secrets, shutil, subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -816,6 +816,17 @@ def letpadel_login(email, password):
     return token
 
 
+@contextlib.contextmanager
+def browser_slot(timeout=45):
+    """Réserve un des rares navigateurs, avec attente bornée (pas de blocage infini)."""
+    if not BROWSERS.acquire(timeout=timeout):
+        raise RuntimeError("Le service est très sollicité en ce moment. Réessaie dans une minute.")
+    try:
+        yield
+    finally:
+        BROWSERS.release()
+
+
 def launch_browser(pw, chrome):
     """Lance un navigateur headless : d'abord le Chrome du système, sinon le Chromium de Playwright."""
     last = None
@@ -853,7 +864,7 @@ def auto_login(provider, email, password, report=lambda m: None):
         raise RuntimeError("Le module playwright n’est pas installé sur ce serveur.")
     chrome = find_chrome()                      # un vrai Chrome du système, s'il y en a un
     report("En attente d’un navigateur libre…")
-    with BROWSERS, sync_playwright() as pw:
+    with browser_slot(), sync_playwright() as pw:
         browser = launch_browser(pw, chrome)
         try:
             ctx = browser.new_context(locale="fr-FR", user_agent=UA, viewport={"width": 1280, "height": 900})
@@ -1735,8 +1746,13 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 const LIVE = window.PADEL_LIVE === true;
 // Démarre la requête des comptes immédiatement, sans attendre la fin du script,
 // pour qu'elle voyage en parallèle (chaîne critique plus courte, cf. Lighthouse).
-const ACCOUNTS_READY = LIVE ? fetch("/api/accounts").then(r=>r.json()).catch(()=>({})) : Promise.resolve({});
-ACCOUNTS_READY.then(a=>{ if(a && a.account) ACCOUNT=a.account; });
+let ACCOUNTS_PRELOAD = LIVE ? fetch("/api/accounts").then(r=>r.json()).catch(()=>({})) : Promise.resolve({});
+// 1re fois : on profite du préchargement ; ensuite : vrai appel pour refléter
+// les connexions qui viennent d'être faites (sinon l'accueil reste figé).
+async function fetchAccounts(){
+  if(ACCOUNTS_PRELOAD){ const p=ACCOUNTS_PRELOAD; ACCOUNTS_PRELOAD=null; try{ return await p; }catch(e){ return {}; } }
+  try{ return await (await fetch("/api/accounts",{cache:"no-store"})).json(); }catch(e){ return {}; }
+}
 const H = (wk, we) => ({wk, we});
 const CLUBS = [
   {id:"4padel", name:"4PADEL Orléans", city:"Fleury-les-Aubrais", courts:"6 pistes indoor", account:true,
@@ -1957,7 +1973,8 @@ function acctRow(x, st, onboarding){
 
 /* Accueil : 4PADEL et Let Padel obligatoires */
 async function checkGate(){
-  try{ S.accounts=await ACCOUNTS_READY; }catch(e){ S.accounts=S.accounts||{}; }
+  S.accounts=await fetchAccounts();
+  ACCOUNT = (S.accounts && S.accounts.account && S.accounts.account.email) ? S.accounts.account : null;
   const a=S.accounts||{};
   const missing=ACCOUNTS.filter(x=>x.required && !ready(a[x.id]));
   $("onbList").innerHTML=ACCOUNTS.map(x=>acctRow(x, a[x.id]||{}, true)).join("");
@@ -2033,7 +2050,8 @@ async function refreshAccounts(){
     $("acctFoot").textContent="Cette page en ligne affiche les horaires d’ouverture. Les créneaux libres s’affichent dans l’outil lancé avec lancer_padel.bat.";
     $("viewTitle").hidden=true; $("viewGroup").hidden=true; $("forgetBtn").hidden=true; return;
   }
-  try{ S.accounts=await (await fetch("/api/accounts")).json(); }catch(e){ S.accounts={}; }
+  S.accounts=await fetchAccounts();
+  ACCOUNT = (S.accounts && S.accounts.account && S.accounts.account.email) ? S.accounts.account : null;
   const a=S.accounts||{};
   $("acctList").innerHTML = ACCOUNTS.map(x=>acctRow(x, a[x.id]||{})).join("");
   $("acctFoot").textContent="Tes connexions sont chiffrées avec une clé gardée dans ce navigateur : personne d’autre, pas même le serveur seul, ne peut les lire. Sur un autre appareil, reconnecte tes comptes.";
