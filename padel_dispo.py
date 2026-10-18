@@ -657,6 +657,69 @@ def letpadel_login(email, password):
     return token
 
 
+def fourpadel_login(email, password):
+    """Connexion 4PADEL par appel direct à l'API LE FIVE : pas de navigateur."""
+    body = urllib.parse.urlencode({"email": email, "password": password}).encode()
+    req = urllib.request.Request("https://api2-front.lefive.fr/login/client?appId=2&isChannelWeb=true",
+                                 data=body, method="POST")
+    for k, v in {"User-Agent": UA, "Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded",
+                 "Origin": "https://www.4padel.fr", "Referer": "https://www.4padel.fr/"}.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401, 403):
+            raise RuntimeError("Connexion refusée : vérifie l’e-mail et le mot de passe.")
+        raise RuntimeError(f"4PADEL a répondu {e.code}.")
+    token = j.get("access_token")
+    if not token:
+        raise RuntimeError("Réponse inattendue de 4PADEL.")
+    return token
+
+
+def smash_login(email, password):
+    """Connexion Smash par appel direct : le jeton revient dans l'URL de redirection (setToken)."""
+    body = urllib.parse.urlencode({"token": "", "redirect": "", "email": email,
+                                   "mot_de_passe": password, "nn": str(int(time.time() * 1000)),
+                                   "livexperience_site_token": "null"}).encode()
+    req = urllib.request.Request(f"{SMASH_BASE}/master/scriptLogin.asp", data=body, method="POST")
+    for k, v in {"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+                 "Origin": SMASH_BASE, "Referer": SMASH_BASE + "/"}.items():
+        req.add_header(k, v)
+    cookies = {}
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            self._location = newurl
+            return None    # on ne suit pas : on veut lire le setToken de l'URL
+
+    opener = urllib.request.build_opener(NoRedirect)
+    location = ""
+    try:
+        resp = opener.open(req, timeout=20)
+        location = resp.headers.get("Location", "")
+        for c in resp.headers.get_all("Set-Cookie") or []:
+            kv = c.split(";", 1)[0]
+            if "=" in kv:
+                cookies[kv.split("=", 1)[0].strip()] = kv.split("=", 1)[1].strip()
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "") if e.headers else ""
+        for c in (e.headers.get_all("Set-Cookie") if e.headers else None) or []:
+            kv = c.split(";", 1)[0]
+            if "=" in kv:
+                cookies[kv.split("=", 1)[0].strip()] = kv.split("=", 1)[1].strip()
+    token = ""
+    m = re.search(r"setToken=([^&]+)", location)
+    if m:
+        token = urllib.parse.unquote(m.group(1))
+    if not token:
+        raise RuntimeError("Connexion refusée : vérifie l’e-mail et le mot de passe.")
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    return {"token": token, "cookies": cookie_str}
+
+
 @contextlib.contextmanager
 def browser_slot(timeout=45):
     """Réserve un des rares navigateurs, avec attente bornée (pas de blocage infini)."""
@@ -695,10 +758,15 @@ def chromium_hint():
 
 
 def auto_login(provider, email, password, report=lambda m: None):
-    """Connexion avec e-mail et mot de passe. Renvoie la session du club."""
+    """Connexion avec e-mail et mot de passe. Renvoie la session du club.
+    Les trois clubs se connectent par appel direct : aucun navigateur nécessaire."""
+    report(f"Connexion à {PROVIDERS[provider]['name']}…")
     if provider == "letpadel":
-        report("Connexion à Let Padel…")
         return letpadel_login(email, password)
+    if provider == "4padel":
+        return fourpadel_login(email, password)
+    if provider == "smash":
+        return smash_login(email, password)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
